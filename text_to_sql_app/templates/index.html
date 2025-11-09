@@ -81,7 +81,12 @@
             </div>
           </div>
           <div class="graph-board__side">
-            <h3>Joins</h3>
+            <h3>Relationships</h3>
+            <div class="graph-board__tabs">
+              <button type="button" class="graph-board__tab graph-board__tab--active" data-tab="all">All</button>
+              <button type="button" class="graph-board__tab" data-tab="auto">Auto-detected</button>
+              <button type="button" class="graph-board__tab" data-tab="manual">Manual</button>
+            </div>
             <div id="graph-edges" class="graph-edge-list"></div>
             <p id="graph-status" class="graph-board__status">Click a column, then another column to create a join.</p>
           </div>
@@ -112,9 +117,11 @@
       let cachedDatasets = [];
       const schemaCache = {};
       let relationshipsState = [];
+      let autoDetectedRelationships = [];
       let nodePositions = {};
       let pendingConnection = null;
       let dragState = null;
+      let activeTab = 'all';
 
       function escapeHtml(str) {
         return str.replace(/[&<>"']/g, (char) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char] || char));
@@ -240,10 +247,11 @@
       async function fetchRelationships() {
         const response = await fetch('/api/relationships');
         if (!response.ok) {
-          return { relationships: [], positions: {}, active: null };
+          return { relationships: [], auto_detected_relationships: [], positions: {}, active: null };
         }
         const data = await response.json();
         relationshipsState = data.relationships || [];
+        autoDetectedRelationships = data.auto_detected_relationships || [];
         nodePositions = data.positions || {};
         return data;
       }
@@ -335,22 +343,55 @@
       function renderRelationshipsList() {
         if (!graphEdges) return;
         graphEdges.innerHTML = '';
-        if (!relationshipsState.length) {
+        
+        // Filter relationships based on active tab
+        let displayRelationships = [];
+        if (activeTab === 'all') {
+          displayRelationships = relationshipsState;
+        } else if (activeTab === 'auto') {
+          displayRelationships = relationshipsState.filter(rel => rel.auto_detected);
+        } else if (activeTab === 'manual') {
+          displayRelationships = relationshipsState.filter(rel => !rel.auto_detected);
+        }
+        
+        if (!displayRelationships.length) {
           const empty = document.createElement('p');
           empty.className = 'graph-edge-empty';
-          empty.textContent = 'No joins defined yet.';
+          empty.textContent = activeTab === 'auto' ? 'No auto-detected relationships.' : 
+                              activeTab === 'manual' ? 'No manual relationships.' : 
+                              'No relationships defined yet.';
           graphEdges.append(empty);
           return;
         }
 
-        relationshipsState.forEach((rel, index) => {
+        displayRelationships.forEach((rel) => {
+          const actualIndex = relationshipsState.indexOf(rel);
+          
           const row = document.createElement('div');
           row.className = 'graph-edge-row';
+          if (rel.auto_detected) {
+            row.classList.add('graph-edge-row--auto');
+          }
 
+          const leftCol = document.createElement('div');
+          leftCol.className = 'graph-edge-col';
           const left = document.createElement('span');
           left.textContent = `${rel.source_alias}.${rel.source_column}`;
+          leftCol.append(left);
+          
+          if (rel.auto_detected) {
+            const badge = document.createElement('span');
+            badge.className = 'graph-edge-badge';
+            badge.textContent = `${Math.round((rel.confidence || 0) * 100)}%`;
+            badge.title = rel.reason || 'Auto-detected';
+            leftCol.append(badge);
+          }
+
+          const rightCol = document.createElement('div');
+          rightCol.className = 'graph-edge-col';
           const right = document.createElement('span');
           right.textContent = `${rel.target_alias}.${rel.target_column}`;
+          rightCol.append(right);
 
           const select = document.createElement('select');
           select.className = 'graph-edge-join';
@@ -362,7 +403,7 @@
           });
           select.value = rel.join_type || 'inner';
           select.addEventListener('change', (event) => {
-            relationshipsState[index].join_type = event.target.value;
+            relationshipsState[actualIndex].join_type = event.target.value;
             renderConnections();
           });
 
@@ -371,12 +412,12 @@
           remove.className = 'graph-edge-remove';
           remove.textContent = 'Remove';
           remove.addEventListener('click', () => {
-            relationshipsState.splice(index, 1);
+            relationshipsState.splice(actualIndex, 1);
             renderRelationshipsList();
             renderConnections();
           });
 
-          row.append(left, select, right, remove);
+          row.append(leftCol, select, rightCol, remove);
           graphEdges.append(row);
         });
       }
@@ -536,12 +577,16 @@
         renderConnections();
       }
 
-      async function sendMessage(event) {
-        event.preventDefault();
-        const message = messageInput.value.trim();
+      async function sendMessage(event, customMessage = null) {
+        event?.preventDefault();
+        const message = customMessage || messageInput.value.trim();
         if (!message) return;
-        createBubble('user', message.replace(/\n/g, '<br />'));
-        messageInput.value = '';
+        
+        if (!customMessage) {
+          createBubble('user', message.replace(/\n/g, '<br />'));
+          messageInput.value = '';
+        }
+        
         try {
           createBubble('bot', '<em>Thinking...</em>');
           const placeholder = chat.lastElementChild;
@@ -556,12 +601,46 @@
           }
           placeholder.querySelector('.bubble__body').innerHTML = data.reply;
           placeholder.querySelector('.bubble__time').textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          
+          // Attach click handlers to alternative buttons
+          attachAlternativeHandlers();
         } catch (error) {
           const placeholder = chat.lastElementChild;
           if (placeholder) {
             placeholder.querySelector('.bubble__body').innerHTML = '<strong>Error:</strong> Could not generate SQL.';
           }
         }
+      }
+      
+      function attachAlternativeHandlers() {
+        // Find all alternative buttons in the latest response
+        const altButtons = chat.querySelectorAll('.alternative-btn:not(.alternative-btn--selected)');
+        altButtons.forEach(btn => {
+          if (btn.dataset.handlerAttached) return; // Avoid duplicate handlers
+          btn.dataset.handlerAttached = 'true';
+          
+          btn.addEventListener('click', async function() {
+            const queryTerm = this.dataset.queryTerm;
+            const table = this.dataset.table;
+            const column = this.dataset.column;
+            
+            // Find the previous user message
+            const bubbles = Array.from(chat.querySelectorAll('.bubble--user'));
+            if (!bubbles.length) return;
+            
+            const lastUserBubble = bubbles[bubbles.length - 1];
+            const originalQuery = lastUserBubble.querySelector('.bubble__body').textContent;
+            
+            // Build modified query that hints at using specific column
+            const modifiedQuery = `${originalQuery} (use ${table}.${column} for "${queryTerm}")`;
+            
+            // Show user clicked alternative
+            createBubble('user', `<em>Using alternative:</em> ${escapeHtml(table)}.${escapeHtml(column)}`);
+            
+            // Re-run query
+            await sendMessage(null, modifiedQuery);
+          });
+        });
       }
 
       async function handleUpload(event) {
@@ -589,11 +668,23 @@
           if (!response.ok) {
             throw new Error(data.detail || 'Upload failed');
           }
-          setUploadStatus(`Table ${data.table} added as ${data.alias} (${data.rows} rows).`, 'success');
+          const autoDetectedCount = data.auto_detected_relationships || 0;
+          let statusMsg = `Table ${data.table} added as ${data.alias} (${data.rows} rows).`;
+          if (autoDetectedCount > 0) {
+            statusMsg += ` ${autoDetectedCount} relationship(s) auto-detected.`;
+          }
+          setUploadStatus(statusMsg, 'success');
           if (uploadForm) uploadForm.reset();
           if (fileInput) fileInput.value = '';
           await refreshDatasets();
-          createBubble('bot', `Added dataset <code>${escapeHtml(data.alias)}</code> (table <code>${escapeHtml(data.table)}</code>). Use the Refresh button when you want the assistant to pick up all new tables.`);
+          
+          let botMsg = `Added dataset <code>${escapeHtml(data.alias)}</code> (table <code>${escapeHtml(data.table)}</code>).`;
+          if (autoDetectedCount > 0) {
+            botMsg += ` Found ${autoDetectedCount} potential relationship(s) between tables. Check the Schema Board to review them.`;
+          } else {
+            botMsg += ` Use the Refresh button when you want the assistant to pick up all new tables.`;
+          }
+          createBubble('bot', botMsg);
         } catch (error) {
           setUploadStatus(error.message, 'error');
         }
@@ -608,8 +699,20 @@
             throw new Error(data.detail || 'Refresh failed');
           }
           renderDatasets(data.datasets || [], data.active);
-          setUploadStatus('Sandbox refreshed. All datasets ready.', 'success');
-          createBubble('bot', 'Sandbox metadata rebuilt. The assistant now knows about all uploaded tables and joins.');
+          const autoDetectedCount = data.auto_detected_relationships || 0;
+          let statusMsg = 'Sandbox refreshed. All datasets ready.';
+          if (autoDetectedCount > 0) {
+            statusMsg += ` ${autoDetectedCount} relationship(s) auto-detected.`;
+          }
+          setUploadStatus(statusMsg, 'success');
+          
+          let botMsg = 'Sandbox metadata rebuilt. The assistant now knows about all uploaded tables';
+          if (autoDetectedCount > 0) {
+            botMsg += ` and ${autoDetectedCount} auto-detected join(s).`;
+          } else {
+            botMsg += '.';
+          }
+          createBubble('bot', botMsg);
         } catch (error) {
           setUploadStatus(error.message, 'error');
         }
@@ -625,6 +728,22 @@
           closeGraphBoard();
         }
       });
+      
+      // Tab switching for relationships
+      document.querySelectorAll('.graph-board__tab').forEach(tab => {
+        tab.addEventListener('click', (event) => {
+          const tabName = event.currentTarget.dataset.tab;
+          activeTab = tabName;
+          
+          // Update active tab styling
+          document.querySelectorAll('.graph-board__tab').forEach(t => t.classList.remove('graph-board__tab--active'));
+          event.currentTarget.classList.add('graph-board__tab--active');
+          
+          // Re-render relationships list
+          renderRelationshipsList();
+        });
+      });
+      
       window.addEventListener('resize', () => {
         if (!graphBoard?.classList.contains('hidden')) {
           requestAnimationFrame(renderConnections);

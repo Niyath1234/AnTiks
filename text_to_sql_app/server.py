@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from .text_to_sql_optimized import TextToSQLConfig, TextToSQLSystem
 from .load_excel import load_excel_to_duckdb
+from .relationship_detector import detect_relationships_for_tables
 
 
 ROOT = Path(__file__).resolve().parent
@@ -32,7 +33,8 @@ SESSION_CONTEXT: Dict[str, Any] = {
     "last_sql": None,
     "table_keys": {},  # alias -> table name
     "active_alias": None,
-    "relationships": [],
+    "relationships": [],  # User-defined and auto-detected relationships
+    "auto_detected_relationships": [],  # Auto-detected only (for reference)
     "graph_positions": {},
 }
 
@@ -73,6 +75,7 @@ def load_dataset_state() -> None:
     SESSION_CONTEXT["table_keys"] = data.get("aliases", {})
     SESSION_CONTEXT["active_alias"] = data.get("active")
     SESSION_CONTEXT["relationships"] = data.get("relationships", [])
+    SESSION_CONTEXT["auto_detected_relationships"] = data.get("auto_detected_relationships", [])
     SESSION_CONTEXT["graph_positions"] = data.get("positions", {})
 
 
@@ -82,12 +85,97 @@ def save_dataset_state() -> None:
         "aliases": SESSION_CONTEXT.get("table_keys", {}),
         "active": SESSION_CONTEXT.get("active_alias"),
         "relationships": SESSION_CONTEXT.get("relationships", []),
+        "auto_detected_relationships": SESSION_CONTEXT.get("auto_detected_relationships", []),
         "positions": SESSION_CONTEXT.get("graph_positions", {}),
     }
     RELATIONSHIPS_PATH.write_text(json.dumps(payload, indent=2))
 
 
 load_dataset_state()
+
+
+def auto_detect_relationships() -> List[Dict[str, Any]]:
+    """
+    Auto-detect relationships between all uploaded tables.
+    Returns list of detected relationships with confidence scores.
+    """
+    aliases = SESSION_CONTEXT.get("table_keys", {})
+    if len(aliases) < 2:
+        # Need at least 2 tables to detect relationships
+        return []
+    
+    try:
+        if not DUCKDB_PATH.exists():
+            return []
+        
+        table_names = list(aliases.values())
+        detected = detect_relationships_for_tables(
+            str(DUCKDB_PATH),
+            table_names,
+            min_confidence=0.5  # Lower threshold to catch more possibilities
+        )
+        
+        # Convert to the format used by the app (with aliases instead of table names)
+        # Create reverse mapping: table_name -> alias
+        table_to_alias = {table: alias for alias, table in aliases.items()}
+        
+        relationships_with_aliases = []
+        for rel in detected:
+            source_alias = table_to_alias.get(rel["source_table"])
+            target_alias = table_to_alias.get(rel["target_table"])
+            
+            if source_alias and target_alias:
+                relationships_with_aliases.append({
+                    "source_alias": source_alias,
+                    "source_column": rel["source_column"],
+                    "target_alias": target_alias,
+                    "target_column": rel["target_column"],
+                    "join_type": "inner",  # Default join type
+                    "confidence": rel["confidence"],
+                    "auto_detected": True,
+                    "reason": rel["reason"],
+                    "match_ratio": rel["match_ratio"]
+                })
+        
+        return relationships_with_aliases
+        
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Could not auto-detect relationships: {e}")
+        return []
+
+
+def merge_relationships_with_auto_detected(
+    user_relationships: List[Dict[str, Any]],
+    auto_detected: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Merge user-defined relationships with auto-detected ones.
+    User-defined relationships take precedence.
+    """
+    merged = []
+    
+    # Add all user relationships first
+    user_pairs = set()
+    for rel in user_relationships:
+        merged.append(rel)
+        # Track this pair (bidirectional)
+        pair1 = (rel.get("source_alias"), rel.get("source_column"), 
+                 rel.get("target_alias"), rel.get("target_column"))
+        pair2 = (rel.get("target_alias"), rel.get("target_column"),
+                 rel.get("source_alias"), rel.get("source_column"))
+        user_pairs.add(pair1)
+        user_pairs.add(pair2)
+    
+    # Add auto-detected relationships that don't conflict with user ones
+    for rel in auto_detected:
+        pair = (rel.get("source_alias"), rel.get("source_column"),
+                rel.get("target_alias"), rel.get("target_column"))
+        
+        if pair not in user_pairs:
+            merged.append(rel)
+    
+    return merged
 
 
 class QueryPayload(BaseModel):
@@ -239,6 +327,90 @@ def augment_message_with_context(message: str) -> str:
 
 def format_reply(result: Dict) -> str:
     lines = []
+    
+    # Show detected columns with confidence scores FIRST (before schema)
+    column_detections = result.get("column_detections")
+    if column_detections and len(column_detections) > 0:
+        table_map: Dict[str, List[Dict[str, Any]]] = {}
+        for detection in column_detections:
+            alias = detection.get("table_alias") or detection.get("table_name") or "unknown"
+            table_map.setdefault(alias, []).append(detection)
+
+        lines.append("<div class=\"section\">")
+        lines.append("<p class=\"section__title\">🎯 Detected Columns</p>")
+        lines.append("<div class=\"detect-wrapper\">")
+
+        for table_alias in sorted(table_map.keys()):
+            options = table_map[table_alias]
+            options.sort(key=lambda det: det.get("confidence", 0), reverse=True)
+
+            lines.append("<div class=\"detect-table\">")
+            lines.append(f"<span class=\"detect-table-label\">{escape(table_alias)}</span>")
+            lines.append("<div class=\"detect-chip-row\">")
+
+            for detection in options:
+                column = detection.get("column_name", "unknown")
+                confidence = int(detection.get("confidence", 0) * 100)
+                lines.append(
+                    f"""<span class="detect-chip">
+                            <span class="detect-chip-label">{escape(column)}</span>
+                            <span class="detect-chip-score">{confidence}%</span>
+                        </span>"""
+                )
+
+            lines.append("</div>")
+            lines.append("</div>")
+
+        lines.append("</div>")
+        lines.append("</div>")
+    
+    # Show column alternatives (if any)
+    column_alternatives = result.get("column_alternatives")
+    if column_alternatives:
+        # reorganize alternatives by table alias
+        table_map: Dict[str, List[Dict[str, Any]]] = {}
+        for query_term, alternatives in column_alternatives.items():
+            for alt in alternatives:
+                table_alias = alt.get("table_alias") or "unknown"
+                entry = dict(alt)
+                entry["query_term"] = query_term
+                table_map.setdefault(table_alias, []).append(entry)
+
+        # Sort each table's alternatives by similarity desc
+        for options in table_map.values():
+            options.sort(key=lambda item: item.get("similarity", 0), reverse=True)
+
+        lines.append("<div class=\"section\">")
+        lines.append("<p class=\"section__title\">🔄 Column Options</p>")
+        lines.append("<p class=\"alt-note\">Click a chip to swap the column in the query.</p>")
+        lines.append("<div class=\"alt-wrapper\">")
+
+        for table_alias in sorted(table_map.keys()):
+            options = table_map[table_alias]
+            lines.append("<div class=\"alt-table\">")
+            lines.append(f"<span class=\"alt-table-label\">{escape(table_alias)}</span>")
+            lines.append("<div class=\"alt-chip-row\">")
+
+            for alt in options:
+                is_selected = alt.get("is_selected", False)
+                button_class = "alt-chip alt-chip--active" if is_selected else "alt-chip"
+                column = alt.get("column_name", "")
+                similarity = int(alt.get("similarity", 0))
+                query_term = alt.get("query_term", "")
+                token_attr = escape(query_term)
+                lines.append(
+                    f"""<button class="{button_class}" data-query-term="{token_attr}" data-table="{escape(table_alias)}"
+                            data-column="{escape(column)}" {'disabled' if is_selected else ''}>
+                            <span class="alt-chip-label">{escape(column)}</span>
+                            <span class="alt-chip-score">{similarity}%</span>
+                        </button>"""
+                )
+
+            lines.append("</div>")
+            lines.append("</div>")
+
+        lines.append("</div>")
+        lines.append("</div>")
 
     schema_info = result.get("schema_info")
     if schema_info:
@@ -353,6 +525,9 @@ async def index(request: Request):
 
 @app.post("/api/query")
 async def query(payload: QueryPayload):
+    import logging
+    import traceback
+    
     message = payload.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
@@ -361,8 +536,24 @@ async def query(payload: QueryPayload):
     message_to_process = augment_message_with_context(message)
     try:
         result = system.query(message_to_process, skip_execution=False, sandbox=True)
-    except Exception as exc:  # pragma: no cover - defensive logging
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        # Log full traceback for debugging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Query failed: {exc}")
+        logger.error(traceback.format_exc())
+        
+        # Return error in HTML format for display
+        error_html = f'''
+            <div class="section">
+                <p class="section__title">❌ Error</p>
+                <p style="color: #ffb3c1;">Could not generate SQL. Error: {escape(str(exc))}</p>
+                <details style="margin-top: 10px; opacity: 0.8;">
+                    <summary style="cursor: pointer;">Show details</summary>
+                    <pre style="font-size: 0.8rem; margin-top: 8px; white-space: pre-wrap;">{escape(traceback.format_exc())}</pre>
+                </details>
+            </div>
+        '''
+        return JSONResponse({"reply": error_html})
 
     reply_html = format_reply(result)
     if result.get("data_columns") and result.get("data_rows"):
@@ -410,6 +601,17 @@ async def upload_excel(
             conn.close()
 
         alias = register_table_alias(table)
+        
+        # Auto-detect relationships if multiple tables exist
+        auto_detected = auto_detect_relationships()
+        SESSION_CONTEXT["auto_detected_relationships"] = auto_detected
+        
+        # Merge with existing user relationships
+        user_rels = [r for r in SESSION_CONTEXT.get("relationships", []) 
+                     if not r.get("auto_detected")]
+        merged_rels = merge_relationships_with_auto_detected(user_rels, auto_detected)
+        SESSION_CONTEXT["relationships"] = merged_rels
+        
         reset_system()
         save_dataset_state()
 
@@ -423,6 +625,7 @@ async def upload_excel(
             "alias": alias,
             "datasets": dataset_list,
             "active": alias,
+            "auto_detected_relationships": len(auto_detected),
         }
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -449,6 +652,16 @@ async def list_datasets():
 
 @app.post("/api/refresh")
 async def refresh_system():
+    # Auto-detect relationships
+    auto_detected = auto_detect_relationships()
+    SESSION_CONTEXT["auto_detected_relationships"] = auto_detected
+    
+    # Merge with existing user relationships
+    user_rels = [r for r in SESSION_CONTEXT.get("relationships", []) 
+                 if not r.get("auto_detected")]
+    merged_rels = merge_relationships_with_auto_detected(user_rels, auto_detected)
+    SESSION_CONTEXT["relationships"] = merged_rels
+    
     reset_system()
     save_dataset_state()
     aliases = SESSION_CONTEXT.get("table_keys", {})
@@ -458,6 +671,7 @@ async def refresh_system():
         "status": "ok",
         "datasets": dataset_list,
         "active": active_alias,
+        "auto_detected_relationships": len(auto_detected),
     }
 
 
@@ -529,6 +743,7 @@ class RelationshipPayload(BaseModel):
 async def get_relationships():
     return {
         "relationships": SESSION_CONTEXT.get("relationships", []),
+        "auto_detected_relationships": SESSION_CONTEXT.get("auto_detected_relationships", []),
         "positions": SESSION_CONTEXT.get("graph_positions", {}),
         "active": SESSION_CONTEXT.get("active_alias"),
     }

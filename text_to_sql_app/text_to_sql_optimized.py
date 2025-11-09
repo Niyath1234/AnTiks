@@ -109,6 +109,8 @@ def find_gguf_file(model_name: str) -> Optional[str]:
 
 # Import shared classes from original file
 from .text_to_sql_architecture import MetadataExtractor, VectorStore, SQLExecutor
+from .multi_table_query_parser import parse_multi_table_query, QueryIntent
+from .column_alternatives import group_alternatives_by_query_term
 
 
 class DuckDBMetadataExtractor(MetadataExtractor):
@@ -461,6 +463,12 @@ class TextToSQLSystem:
     """Optimized Text-to-SQL system with GGUF support"""
 
     COLUMN_VALUE_LIMIT = 40
+    SQL_KEYWORDS = {
+        "select", "from", "where", "join", "inner", "left", "right", "full", "outer",
+        "on", "group", "by", "order", "asc", "desc", "limit", "distinct", "count",
+        "sum", "avg", "min", "max", "case", "when", "then", "else", "end", "and",
+        "or", "not", "as", "having"
+    }
     
     def __init__(self, config: TextToSQLConfig):
         # Override to use optimized SQLLLM
@@ -479,6 +487,24 @@ class TextToSQLSystem:
         
         # Initialize components
         self._initialize_system()
+
+    def _filter_relationships(self) -> None:
+        """Remove relationships that reference tables not currently loaded."""
+        if not self.relationships:
+            return
+        valid_aliases = set(self.table_columns_map.keys())
+        filtered = []
+        for rel in self.relationships:
+            src = rel.get("source_alias")
+            tgt = rel.get("target_alias")
+            if src in valid_aliases and tgt in valid_aliases:
+                filtered.append(rel)
+        if len(filtered) != len(self.relationships):
+            logger.info(
+                "Filtered %d stale relationships referencing unloaded tables",
+                len(self.relationships) - len(filtered),
+            )
+        self.relationships = filtered
 
     @staticmethod
     def _is_table_inventory_query(normalized_query: str) -> bool:
@@ -955,6 +981,7 @@ class TextToSQLSystem:
             logger.info("Loaded table metadata: %s", list(self.table_columns_map.keys()))
             if self.relationships:
                 logger.info("Loaded %d relationships", len(self.relationships))
+                self._filter_relationships()
             
             logger.info("System initialized successfully")
             self._metadata_loaded = True
@@ -1334,6 +1361,152 @@ class TextToSQLSystem:
                 return instruction, factor, label
         return None, None, None
 
+    def _sanitize_sql_columns(
+        self,
+        sql: str,
+        allowed_aliases: List[str],
+        schema_info: Dict[str, Any],
+    ) -> str:
+        """
+        Ensure generated SQL references only real columns from loaded tables.
+        Rewrites hallucinated column names (e.g., loan_id -> loan_account_id).
+        """
+        if not sql:
+            return sql
+
+        # Collect allowed columns from current aliases
+        allowed_columns: Dict[str, str] = {}
+        aliases = allowed_aliases or list(self.table_columns_map.keys())
+        for alias in aliases:
+            table_meta = self.table_columns_map.get(alias)
+            if not table_meta:
+                continue
+            for col in table_meta.get("columns", []):
+                allowed_columns.setdefault(col.lower(), col)
+
+        # Include explicitly selected columns from schema info
+        for col in schema_info.get("columns", []) or []:
+            allowed_columns[col.lower()] = col
+
+        if not allowed_columns:
+            return sql
+
+        # Map query tokens to preferred columns (from detection step)
+        token_map: Dict[str, str] = {}
+        for detection in schema_info.get("column_detections", []) or []:
+            token_raw = detection.get("query_token") or ""
+            column_name = detection.get("column_name")
+            if not column_name:
+                continue
+            normalized_token = token_raw.strip().lower().replace(" ", "_")
+            if normalized_token:
+                token_map.setdefault(normalized_token, column_name)
+            token_map.setdefault(column_name.lower(), column_name)
+
+        # Helper to choose replacement
+        def choose_column(token: str) -> str:
+            lower = token.lower()
+            if lower in allowed_columns:
+                return allowed_columns[lower]
+            norm = lower.replace(" ", "_")
+            if norm in allowed_columns:
+                return allowed_columns[norm]
+            if lower in token_map and token_map[lower].lower() in allowed_columns:
+                return allowed_columns[token_map[lower].lower()]
+            if norm in token_map and token_map[norm].lower() in allowed_columns:
+                return allowed_columns[token_map[norm].lower()]
+            if lower in token_map:
+                return token_map[lower]
+            if norm in token_map:
+                return token_map[norm]
+            # Fallback: fuzzy match
+            matches = difflib.get_close_matches(lower, list(allowed_columns.keys()), n=1, cutoff=0.6)
+            if matches:
+                return allowed_columns[matches[0]]
+            # Final fallback: sequence ratio against each allowed column
+            best_match = None
+            best_score = 0.0
+            for candidate in allowed_columns.keys():
+                score = difflib.SequenceMatcher(None, lower, candidate).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_match = candidate
+            if best_match and best_score >= 0.55:
+                return allowed_columns[best_match]
+            return token
+
+        sql = re.sub(
+            r"(\.)([A-Za-z_][\w]*)",
+            lambda m: m.group(1) + choose_column(m.group(2)),
+            sql,
+        )
+
+        def standalone_replacer(match):
+            token = match.group(0)
+            lower = token.lower()
+            if lower in self.SQL_KEYWORDS:
+                return token
+            if lower in allowed_columns or lower in token_map:
+                return choose_column(token)
+            return token
+
+        sql = re.sub(r"\b([A-Za-z_][\w]*)\b", standalone_replacer, sql)
+        return sql
+
+    def _sanitize_sql_tables(
+        self,
+        sql: str,
+        allowed_aliases: List[str],
+        schema_info: Dict[str, Any],
+    ) -> str:
+        """
+        Remove JOIN clauses that reference tables not currently loaded.
+        If FROM references an unavailable table, replace it with the first allowed table.
+        """
+        if not sql:
+            return sql
+
+        allowed_aliases_set = set(allowed_aliases or [])
+        if not allowed_aliases_set:
+            allowed_aliases_set = set(self.table_columns_map.keys())
+
+        allowed_table_names = {
+            meta["name"]
+            for alias, meta in self.table_columns_map.items()
+            if alias in allowed_aliases_set or not allowed_aliases
+        }
+        allowed_table_names = {name.lower() for name in allowed_table_names if name}
+
+        # Sanitize FROM clause
+        def from_replacer(match):
+            table_name = match.group(1)
+            lower = table_name.lower()
+            if lower in allowed_table_names:
+                return match.group(0)
+            if allowed_table_names:
+                replacement = next(iter(allowed_table_names))
+                return f"FROM {replacement}"
+            return match.group(0)
+
+        sql = re.sub(r"\bFROM\s+([A-Za-z_][\w]*)", from_replacer, sql, flags=re.IGNORECASE)
+
+        # Remove disallowed joins
+        join_pattern = re.compile(
+            r"\bJOIN\s+([A-Za-z_][\w]*)\s+(?:AS\s+)?[A-Za-z_][\w]*\s+ON\b"
+            r"[^;]*?(?=\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bHAVING\b|$)",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        def join_replacer(match):
+            table_name = match.group(1)
+            if table_name.lower() in allowed_table_names:
+                return match.group(0)
+            logger.info("Removing join on unavailable table %s", table_name)
+            return ""
+
+        sql = join_pattern.sub(join_replacer, sql)
+        return sql
+
     def _build_prompt(
         self,
         user_query: str,
@@ -1364,7 +1537,8 @@ class TextToSQLSystem:
         analysis = self._analyze_request(refined_summary, analysis_tables, columns_context)
         
         instruction_lines = [
-            "- Use only the tables and columns provided in the schema context.",
+            "- Use ONLY the EXACT table and column names provided in the schema context below. DO NOT make up or guess column names.",
+            "- If a column name seems close but doesn't match exactly, DO NOT use it. Only use columns that are explicitly listed.",
             "- When the request asks for totals, averages, yearly or grouped results, include the appropriate aggregate functions and GROUP BY clauses.",
             "- Only add filters or date conditions if they are explicitly mentioned in the question. Do not infer additional constraints.",
             "- When returning identifiers, names, or list-style answers without aggregates, use DISTINCT so each item appears once unless duplicates are explicitly requested.",
@@ -1427,6 +1601,24 @@ class TextToSQLSystem:
         analysis_lines.append(f"Expected result: {analysis['result_format']}")
         analysis_block = "\n".join(analysis_lines)
 
+        # Build explicit column list
+        column_reminder = []
+        for result in metadata_context:
+            doc = result.get('document', '')
+            if 'Table: ' in doc and 'Columns: ' in doc:
+                table_line = doc.split('\n')[0]  # Get "Table: X"
+                columns_line = doc.split('Columns: ')[1] if 'Columns: ' in doc else ''
+                # Extract just column names (before the data type)
+                if columns_line:
+                    column_reminder.append(f"{table_line}:")
+                    parts = columns_line.split(', ')
+                    for part in parts[:10]:  # Limit to avoid huge lists
+                        col_name = part.split(' (')[0].strip() if ' (' in part else part.split('[')[0].strip()
+                        if col_name:
+                            column_reminder.append(f"  • {col_name}")
+        
+        columns_reminder_text = '\n'.join(column_reminder) if column_reminder else '(see schema above)'
+        
         if "sqlcoder" in self.config.llm_model.lower():
             prompt = f"""### Task
 Generate a SQL query to answer the following question: {clean_query}
@@ -1434,7 +1626,10 @@ Generate a SQL query to answer the following question: {clean_query}
 ### Database Schema
 {context_text}
 
-+{analysis_block}
+### EXACT Column Names (use these EXACTLY as written)
+{columns_reminder_text}
+
+{analysis_block}
 
 ### Instructions
 {instructions}
@@ -1450,6 +1645,119 @@ Database Schema:
 {context_text}
 
 +{analysis_block}
+
+Instructions:
+{instructions}
+
+SQL Query:
+"""
+        return prompt
+    
+    def _build_multi_table_prompt(
+        self,
+        user_query: str,
+        query_intent: QueryIntent,
+        metadata_context: List[Dict],
+        unit_instruction: Optional[str] = None,
+        value_instruction: Optional[str] = None,
+    ) -> str:
+        """Build prompt for multi-table query with explicit join instructions"""
+        
+        context_text = "\n\n".join([result["document"] for result in metadata_context])
+        
+        # Build join instructions
+        join_instructions = []
+        if query_intent.required_joins:
+            join_descriptions = []
+            for join in query_intent.required_joins:
+                src_alias = join.get('source_alias')
+                src_col = join.get('source_column')
+                tgt_alias = join.get('target_alias')
+                tgt_col = join.get('target_column')
+                join_type = join.get('join_type', 'inner').upper()
+                
+                join_desc = f"{join_type} JOIN {tgt_alias} ON {src_alias}.{src_col} = {tgt_alias}.{tgt_col}"
+                join_descriptions.append(join_desc)
+            
+            join_instructions.append(
+                f"- Use these joins to connect tables: {'; '.join(join_descriptions)}"
+            )
+        
+        # Build column selection hints
+        column_hints = []
+        for match in query_intent.requested_columns:
+            column_hints.append(f"{match.table_alias}.{match.column_name}")
+        
+        if column_hints:
+            join_instructions.append(
+                f"- Include these columns in the query: {', '.join(column_hints[:10])}"
+            )
+        
+        # Build operation hints
+        if query_intent.aggregations:
+            agg_desc = ', '.join(query_intent.aggregations)
+            join_instructions.append(f"- Apply these aggregations: {agg_desc}")
+        
+        if query_intent.grouping:
+            join_instructions.append("- Use GROUP BY for aggregated results")
+        
+        if query_intent.ordering:
+            join_instructions.append(f"- Order results {query_intent.ordering}")
+        
+        instruction_lines = [
+            "- Use ONLY the EXACT table and column names from the schema context. DO NOT invent or guess column names.",
+            "- Follow the join specifications exactly as provided.",
+            "- When aggregating, ensure all non-aggregated columns are in GROUP BY.",
+            "- Return only the final SQL query without explanations.",
+            "- CRITICAL: Every column name in your SQL must appear exactly in the schema below. No variations or similar names.",
+        ]
+        
+        instruction_lines.extend(join_instructions)
+        
+        if unit_instruction:
+            instruction_lines.append(f"- {unit_instruction}")
+        if value_instruction:
+            instruction_lines.append(f"- {value_instruction}")
+        
+        instructions = "Follow these rules when writing SQL:\n" + "\n".join(instruction_lines)
+        
+        # Build analysis
+        analysis_lines = [
+            "### Analysis",
+            f"Task: {query_intent.original_query}",
+            f"Tables needed: {', '.join(query_intent.required_tables)}",
+            f"Operations: {', '.join(query_intent.operations)}",
+        ]
+        
+        if query_intent.requested_columns:
+            col_summary = [f"{m.table_alias}.{m.column_name}" for m in query_intent.requested_columns[:5]]
+            analysis_lines.append(f"Key columns: {', '.join(col_summary)}")
+        
+        analysis_block = "\n".join(analysis_lines)
+        
+        if "sqlcoder" in self.config.llm_model.lower():
+            prompt = f"""### Task
+Generate a SQL query to answer the following question: {user_query}
+
+### Database Schema
+{context_text}
+
+{analysis_block}
+
+### Instructions
+{instructions}
+
+### SQL Query
+"""
+        else:
+            prompt = f"""You are a SQL expert. Generate a SQL query to answer the following question.
+
+Question: {user_query}
+
+Database Schema:
+{context_text}
+
+{analysis_block}
 
 Instructions:
 {instructions}
@@ -1515,11 +1823,12 @@ Corrected SQL Query:
  
         alias_lookup_global = {meta["name"]: alias for alias, meta in self.table_columns_map.items()}
         value_instruction: Optional[str] = None
-        unit_instruction, unit_factor, unit_label = self._detect_unit_instruction(user_query.lower())
+        base_query_line = next((line.strip() for line in user_query.splitlines() if line.strip()), user_query.strip())
+        unit_instruction, unit_factor, unit_label = self._detect_unit_instruction(base_query_line.lower())
         metadata_context_docs: List[Dict[str, Any]] = []
 
         # Step 1: Check if schema is provided in query (PRIORITY - use this if found)
-        query_schema = self._extract_schema_from_query(user_query)
+        query_schema = self._extract_schema_from_query(base_query_line)
         use_query_schema = query_schema is not None
         
         if use_query_schema:
@@ -1556,7 +1865,7 @@ Corrected SQL Query:
                 "value_corrections": [],
                 "column_corrections": [],
             }
-            user_lower = user_query.lower()
+            user_lower = base_query_line.lower()
             detected_aliases = []
             for alias, meta in self.table_columns_map.items():
                 table_name = meta["name"]
@@ -1592,6 +1901,18 @@ Corrected SQL Query:
                 meta = self.table_columns_map.get(alias)
                 if meta:
                     allowed_tables.append(meta["name"])
+            schema_info_used["tables"] = allowed_tables
+
+        # Ensure we only keep aliases that actually exist right now
+        valid_aliases = set(self.table_columns_map.keys())
+        allowed_aliases = [alias for alias in (allowed_aliases or []) if alias in valid_aliases]
+        # Recompute allowed tables to match filtered aliases
+        if allowed_aliases:
+            allowed_tables = []
+            for alias in allowed_aliases:
+                table_meta = self.table_columns_map.get(alias)
+                if table_meta:
+                    allowed_tables.append(table_meta["name"])
             schema_info_used["tables"] = allowed_tables
  
         # Build context documents explicitly from allowed tables
@@ -1633,7 +1954,28 @@ Corrected SQL Query:
             detected_columns = self._detect_columns_from_query(user_query, schema_info_used.get("tables", []))
             if detected_columns:
                 schema_info_used["columns"] = detected_columns
-            table_name_primary = schema_info_used.get("tables", [None])[0]
+                # Record detections for UI/alternatives
+                table_alias_primary = None
+                tables_list = schema_info_used.get("tables", [])
+                if tables_list:
+                    table_alias_primary = alias_lookup_global.get(tables_list[0])
+                detections = schema_info_used.get("column_detections", [])
+                for col in detected_columns:
+                    detections.append(
+                        {
+                            "table_name": tables_list[0] if tables_list else None,
+                            "table_alias": table_alias_primary,
+                            "column_name": col,
+                            "query_token": col.replace("_", " "),
+                            "confidence": 0.9,
+                            "match_type": "detected",
+                        }
+                    )
+                schema_info_used["column_detections"] = detections
+            
+            # Get primary table if available
+            tables_list = schema_info_used.get("tables", [])
+            table_name_primary = tables_list[0] if tables_list else None
             table_alias_primary = None
             if table_name_primary:
                 table_alias_primary = alias_lookup_global.get(table_name_primary)
@@ -1664,7 +2006,7 @@ Corrected SQL Query:
         else:
             schema_info_used.setdefault("column_corrections", [])
 
-        normalized_query = user_query.strip().lower()
+        normalized_query = base_query_line.strip().lower()
         if self._is_table_inventory_query(normalized_query):
             all_tables = sorted({meta.get("name") for meta in self.table_columns_map.values() if meta.get("name")})
             schema_snapshot = {
@@ -1704,7 +2046,7 @@ Corrected SQL Query:
                     "Use conditional aggregation within table `{}`: compute SUM(CASE WHEN <pivot_column> = 'Value' THEN <measure> ELSE 0 END) for each distinct pivot value, group by the row dimension, and avoid JOIN clauses.".format(allowed_tables[0])
                 )
 
-        normalized_query = user_query.strip().lower()
+        normalized_query = base_query_line.strip().lower()
         allowed_aliases_list = allowed_aliases if isinstance(allowed_aliases, list) else list(allowed_aliases) if allowed_aliases else []
 
         def resolve_primary_table() -> Tuple[Optional[str], Optional[str]]:
@@ -1746,6 +2088,8 @@ Corrected SQL Query:
                     "attempts": 0,
                     "metadata_used": schema_info_used.get("tables", []),
                     "schema_info": schema_info_used,
+                    "column_detections": schema_info_used.get("column_detections", []),
+                    "column_alternatives": schema_info_used.get("column_alternatives", {}),
                     "sandbox_validated": False,
                     "data_columns": ["column_name"],
                     "data_rows": rows,
@@ -1754,18 +2098,81 @@ Corrected SQL Query:
 
         allowed_tables_for_prompt = allowed_tables or schema_info_used.get("tables", [])
 
-        prompt = self._build_prompt(
-            user_query,
-            metadata_context_docs,
-            correction_notes,
-            unit_instruction,
-            value_instruction,
-            allowed_tables=allowed_tables_for_prompt,
-            pivot_instruction=pivot_instruction,
-            fallback_instruction=fallback_instruction,
-            column_corrections=schema_info_used.get("column_corrections"),
-            columns_context=schema_info_used.get("columns", []),
-        )
+        # Determine if this is a multi-table query
+        is_multi_table = len(allowed_tables_for_prompt) > 1
+        query_intent = None
+        
+        if is_multi_table and self.relationships:
+            # Use multi-table query parser
+            try:
+                query_intent = parse_multi_table_query(
+                    user_query,
+                    self.table_columns_map,
+                    self.relationships
+                )
+                
+                # Update schema_info with parsed intent
+                if query_intent.requested_columns:
+                    # Add any columns found by the parser
+                    for match in query_intent.requested_columns:
+                        if match.column_name not in schema_info_used.get("columns", []):
+                            schema_info_used.setdefault("columns", []).append(match.column_name)
+                
+                logger.info(f"Multi-table query detected. Tables: {query_intent.required_tables}, Joins: {len(query_intent.required_joins)}")
+                
+                # Store column detections for response
+                schema_info_used["column_detections"] = [
+                    {
+                        "table_name": match.table_name,
+                        "table_alias": match.table_alias,
+                        "column_name": match.column_name,
+                        "query_token": match.query_token,
+                        "confidence": match.confidence,
+                        "match_type": match.match_type
+                    }
+                    for match in query_intent.requested_columns
+                ]
+                
+            except Exception as e:
+                logger.warning(f"Could not parse multi-table query: {e}. Falling back to standard prompt.")
+                is_multi_table = False
+        
+        # Find alternative columns (for both single and multi table cases)
+        try:
+            alternatives = group_alternatives_by_query_term(
+                user_query,
+                self.table_columns_map,
+                schema_info_used.get("column_detections", []),
+                top_k=3
+            )
+            if alternatives:
+                schema_info_used["column_alternatives"] = alternatives
+                logger.info(f"Found alternatives for: {list(alternatives.keys())}")
+        except Exception as alt_error:
+            logger.warning(f"Could not find column alternatives: {alt_error}")
+        
+        # Build appropriate prompt
+        if is_multi_table and query_intent and query_intent.required_joins:
+            prompt = self._build_multi_table_prompt(
+                user_query,
+                query_intent,
+                metadata_context_docs,
+                unit_instruction,
+                value_instruction,
+            )
+        else:
+            prompt = self._build_prompt(
+                user_query,
+                metadata_context_docs,
+                correction_notes,
+                unit_instruction,
+                value_instruction,
+                allowed_tables=allowed_tables_for_prompt,
+                pivot_instruction=pivot_instruction,
+                fallback_instruction=fallback_instruction,
+                column_corrections=schema_info_used.get("column_corrections"),
+                columns_context=schema_info_used.get("columns", []),
+            )
         
         # Step 3: Generate SQL with self-correction loop
         sql = None
@@ -1783,6 +2190,18 @@ Corrected SQL Query:
                     sql = self._correct_sql(sql, last_error, user_query, metadata_context_docs, allowed_tables)
                 
                 logger.info(f"Generated SQL: {sql}")
+
+                sql = self._sanitize_sql_tables(
+                    sql,
+                    allowed_aliases_list,
+                    schema_info_used,
+                )
+
+                sql = self._sanitize_sql_columns(
+                    sql,
+                    allowed_aliases_list,
+                    schema_info_used,
+                )
                 
                 try:
                     sql = self._cast_numeric_aggregates(sql)
@@ -1839,6 +2258,8 @@ Corrected SQL Query:
                         "attempts": attempt,
                         "metadata_used": [r.get("metadata", {}).get("table_name", "unknown") for r in metadata_context_docs if r.get("metadata")],
                         "schema_info": schema_info_used,
+                        "column_detections": schema_info_used.get("column_detections", []),
+                        "column_alternatives": schema_info_used.get("column_alternatives", {}),
                         "sandbox_validated": False,
                         "data_columns": None,
                         "data_rows": None,
@@ -1856,6 +2277,8 @@ Corrected SQL Query:
                         "attempts": attempt,
                         "metadata_used": [r.get("metadata", {}).get("table_name", "unknown") for r in metadata_context_docs if r.get("metadata")],
                         "schema_info": schema_info_used,
+                        "column_detections": schema_info_used.get("column_detections", []),
+                        "column_alternatives": schema_info_used.get("column_alternatives", {}),
                         "sandbox_validated": False,
                         "data_columns": None,
                         "data_rows": None,
@@ -1886,6 +2309,8 @@ Corrected SQL Query:
                                 "attempts": attempt,
                                 "metadata_used": [r.get("metadata", {}).get("table_name", "unknown") for r in metadata_context_docs if r.get("metadata")],
                                 "schema_info": schema_info_used,
+                                "column_detections": schema_info_used.get("column_detections", []),
+                                "column_alternatives": schema_info_used.get("column_alternatives", {}),
                                 "sandbox_validated": sandbox,
                                 "data_columns": data_columns,
                                 "data_rows": data_rows,
@@ -1897,13 +2322,15 @@ Corrected SQL Query:
                     except Exception as e:
                         logger.warning(f"Could not execute query: {e}. Table may not exist.")
                         message = f"SQL generated successfully. (Execution skipped - {str(e)})"
-                        return {
-                            "success": True,
-                            "sql": sql,
-                            "status_message": message,
-                            "attempts": attempt,
+                    return {
+                        "success": True,
+                        "sql": sql,
+                        "status_message": message,
+                        "attempts": attempt,
                             "metadata_used": [r.get("metadata", {}).get("table_name", "unknown") for r in metadata_context_docs if r.get("metadata")],
                             "schema_info": schema_info_used,
+                            "column_detections": schema_info_used.get("column_detections", []),
+                            "column_alternatives": schema_info_used.get("column_alternatives", {}),
                             "sandbox_validated": False,
                             "data_columns": None,
                             "data_rows": None,
@@ -1925,6 +2352,8 @@ Corrected SQL Query:
             "attempts": attempt,
             "metadata_used": [r.get("metadata", {}).get("table_name", "unknown") for r in metadata_context_docs if r.get("metadata")],
             "schema_info": schema_info_used,
+            "column_detections": schema_info_used.get("column_detections", []),
+            "column_alternatives": schema_info_used.get("column_alternatives", {}),
             "sandbox_validated": False,
             "status_message": f"SQL generation failed after {attempt} attempts: {last_error}",
             "data_columns": None,
@@ -2003,7 +2432,7 @@ Corrected SQL Query:
             add_op("MIN")
         if any(keyword in lower for keyword in ["distinct", "unique"]):
             add_op("DISTINCT")
-        if any(keyword in lower for keyword in [" per ", " by ", "group", "split", "each "]):
+        if any(keyword in lower for keyword in [" per ", " by ", "group", "split "]):
             add_op("GROUP BY")
         if any(keyword in lower for keyword in ["top", "highest", "lowest", "ascending", "descending"]):
             add_op("ORDER BY")
