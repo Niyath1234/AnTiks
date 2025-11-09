@@ -1579,7 +1579,14 @@ Corrected SQL Query:
                     elif tgt in allowed_alias_set and src not in allowed_alias_set:
                         allowed_alias_set.add(src)
 
-            allowed_aliases = list(allowed_alias_set)
+            ordered_aliases: List[str] = []
+            for alias in detected_aliases:
+                if alias in allowed_alias_set and alias not in ordered_aliases:
+                    ordered_aliases.append(alias)
+            for alias in allowed_alias_set:
+                if alias not in ordered_aliases:
+                    ordered_aliases.append(alias)
+            allowed_aliases = ordered_aliases
             allowed_tables = []
             for alias in allowed_aliases:
                 meta = self.table_columns_map.get(alias)
@@ -1696,6 +1703,54 @@ Corrected SQL Query:
                 pivot_instruction = (
                     "Use conditional aggregation within table `{}`: compute SUM(CASE WHEN <pivot_column> = 'Value' THEN <measure> ELSE 0 END) for each distinct pivot value, group by the row dimension, and avoid JOIN clauses.".format(allowed_tables[0])
                 )
+
+        normalized_query = user_query.strip().lower()
+        allowed_aliases_list = allowed_aliases if isinstance(allowed_aliases, list) else list(allowed_aliases) if allowed_aliases else []
+
+        def resolve_primary_table() -> Tuple[Optional[str], Optional[str]]:
+            alias = None
+            table = None
+            if allowed_aliases_list:
+                alias = allowed_aliases_list[0]
+            elif allowed_tables:
+                alias = alias_lookup_global.get(allowed_tables[0])
+            if alias:
+                table_entry = self.table_columns_map.get(alias)
+                if table_entry:
+                    table = table_entry.get("name")
+            elif allowed_tables:
+                table = allowed_tables[0]
+                alias = alias_lookup_global.get(table)
+            return alias, table
+
+        alias_for_columns, table_for_columns = resolve_primary_table()
+        column_request_keywords = ["column", "columns", "fields", "schema"]
+        wants_columns_only = any(keyword in normalized_query for keyword in column_request_keywords)
+
+        if wants_columns_only and alias_for_columns:
+            table_entry = self.table_columns_map.get(alias_for_columns)
+            if table_entry:
+                column_list = table_entry.get("columns", [])
+                schema_info_used["columns"] = column_list
+                schema_info_used["tables"] = [table_entry.get("name") or table_for_columns or alias_for_columns]
+                doc = None
+                if table_entry.get("name"):
+                    doc = self._build_table_document(table_entry.get("name"))
+                if doc:
+                    schema_info_used["context"] = [doc]
+                rows = [{"column_name": col} for col in column_list]
+                return {
+                    "success": True,
+                    "sql": f"-- Columns for table {table_entry.get('name') or table_for_columns or alias_for_columns}",
+                    "status_message": "Returned schema columns from metadata.",
+                    "attempts": 0,
+                    "metadata_used": schema_info_used.get("tables", []),
+                    "schema_info": schema_info_used,
+                    "sandbox_validated": False,
+                    "data_columns": ["column_name"],
+                    "data_rows": rows,
+                    "row_count": len(rows),
+                }
 
         allowed_tables_for_prompt = allowed_tables or schema_info_used.get("tables", [])
 
