@@ -9,6 +9,7 @@ import logging
 import sqlite3
 import re
 import difflib
+import difflib
 import duckdb
 import math
 from typing import Dict, List, Optional, Tuple, Any
@@ -1453,6 +1454,22 @@ class TextToSQLSystem:
         sql = re.sub(r"\b([A-Za-z_][\w]*)\b", standalone_replacer, sql)
         return sql
 
+    def _coerce_numeric_operations(self, sql: str) -> str:
+        """Wrap subtraction expressions so both sides are cast to DOUBLE."""
+        if not sql:
+            return sql
+
+        def replacer(match):
+            left = match.group(1)
+            right = match.group(2)
+            return f"(TRY_CAST({left} AS DOUBLE) - TRY_CAST({right} AS DOUBLE))"
+
+        pattern = re.compile(
+            r"(?<!CASE\s)([A-Za-z_][\w\.]*)\s*-\s*([A-Za-z_][\w\.]*)",
+            flags=re.IGNORECASE,
+        )
+        return pattern.sub(replacer, sql)
+
     def _sanitize_sql_tables(
         self,
         sql: str,
@@ -2202,6 +2219,8 @@ Corrected SQL Query:
                     allowed_aliases_list,
                     schema_info_used,
                 )
+
+                sql = self._coerce_numeric_operations(sql)
                 
                 try:
                     sql = self._cast_numeric_aggregates(sql)

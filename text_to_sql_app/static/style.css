@@ -363,6 +363,37 @@ body {
   gap: 10px;
 }
 
+.sidebar__form-actions--vertical {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.sidebar__open-upload {
+  border: none;
+  border-radius: 16px;
+  padding: 12px 18px;
+  font-size: 0.85rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  background: linear-gradient(135deg, #ffb199, #ff0844);
+  color: #050714;
+  font-weight: 600;
+  box-shadow: 0 16px 30px rgba(255, 120, 120, 0.25);
+  transition: transform 0.15s ease, box-shadow 0.2s ease;
+}
+
+.sidebar__open-upload:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 20px 36px rgba(255, 120, 120, 0.32);
+}
+
+.sidebar__open-upload:active {
+  transform: translateY(0);
+}
+
 .sidebar__form-actions button {
   border: none;
   border-radius: 14px;
@@ -997,6 +1028,171 @@ body {
   background: rgba(12, 18, 26, 0.1);
 }
 
+<<<<<<< Current (Your changes)
+=======
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal.hidden {
+  display: none;
+}
+
+.modal__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(3, 7, 18, 0.72);
+  backdrop-filter: blur(6px);
+}
+
+.modal__panel {
+  position: relative;
+  width: min(520px, 92vw);
+  background: rgba(9, 13, 32, 0.95);
+  border-radius: 20px;
+  border: 1px solid rgba(148, 163, 255, 0.3);
+  box-shadow: 0 30px 70px rgba(3, 7, 18, 0.7);
+  padding: 24px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.modal__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.modal__header h2 {
+  margin: 0;
+  font-size: 1.05rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #f2f4ff;
+}
+
+.modal__close {
+  border: none;
+  border-radius: 999px;
+  width: 32px;
+  height: 32px;
+  font-size: 1.4rem;
+  background: rgba(148, 163, 255, 0.18);
+  color: #f3f4ff;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s ease, transform 0.2s ease;
+}
+
+.modal__close:hover {
+  background: rgba(148, 163, 255, 0.28);
+  transform: translateY(-1px);
+}
+
+.modal__form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.modal__form label {
+  font-size: 0.76rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  opacity: 0.72;
+}
+
+.modal__form input[type="text"],
+.modal__form input[type="number"] {
+  border: 1px solid rgba(148, 163, 255, 0.24);
+  border-radius: 14px;
+  padding: 10px 12px;
+  font-size: 0.9rem;
+  background: rgba(12, 16, 38, 0.85);
+  color: #eef4ff;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.modal__form input:focus {
+  outline: none;
+  border-color: rgba(128, 201, 255, 0.75);
+  box-shadow: 0 0 0 3px rgba(128, 201, 255, 0.18);
+}
+
+.upload-dropzone {
+  border: 2px dashed rgba(148, 163, 255, 0.35);
+  border-radius: 16px;
+  background: rgba(5, 8, 24, 0.7);
+  padding: 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.upload-dropzone--hover {
+  border-color: rgba(64, 224, 208, 0.6);
+  background: rgba(12, 24, 40, 0.85);
+}
+
+.upload-dropzone__icon {
+  font-size: 2rem;
+  display: block;
+  margin-bottom: 8px;
+}
+
+.upload-dropzone__text {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.upload-dropzone__browse {
+  color: #7afcff;
+  font-weight: 600;
+}
+
+.upload-dropzone__hint {
+  margin: 6px 0 0;
+  font-size: 0.78rem;
+  opacity: 0.65;
+}
+
+.modal__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.modal__actions button {
+  border: none;
+  border-radius: 14px;
+  padding: 10px 16px;
+  font-size: 0.82rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.modal__actions #upload-btn {
+  background: linear-gradient(135deg, #ffb199, #ff0844);
+  color: #050714;
+  font-weight: 600;
+}
+
+.modal__actions #upload-modal-cancel {
+  background: rgba(12, 16, 38, 0.82);
+  border: 1px solid rgba(148, 163, 255, 0.35);
+  color: #f0f4ff;
+}
+>>>>>>> Incoming (Background Agent changes)
 @media (max-width: 640px) {
   .app {
     width: 100vw;

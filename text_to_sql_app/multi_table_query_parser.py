@@ -70,6 +70,36 @@ class MultiTableQueryParser:
         
         # Build indices for fast lookups
         self._build_indices()
+        self.stopwords = self._load_stopwords()
+
+    def _load_stopwords(self) -> Set[str]:
+        """Load stopwords from NLTK with a fallback set."""
+        fallback = {
+            "a", "an", "and", "are", "as", "at", "be", "but", "by", "for",
+            "if", "in", "into", "is", "it", "no", "not", "of", "on", "or",
+            "such", "that", "the", "their", "then", "there", "these",
+            "they", "this", "to", "was", "will", "with", "each", "per",
+            "across", "within", "between", "from", "using"
+        }
+        try:
+            import nltk
+            from nltk.corpus import stopwords
+            try:
+                words = stopwords.words("english")
+            except LookupError:
+                nltk.download("stopwords", quiet=True)
+                words = stopwords.words("english")
+            return set(word.lower() for word in words) | fallback
+        except Exception:
+            return fallback
+
+    def _is_stopword(self, token: str) -> bool:
+        """Check if a token is a stopword; handles small typos via fuzzy match."""
+        lower = token.lower()
+        if lower in self.stopwords:
+            return True
+        close = difflib.get_close_matches(lower, list(self.stopwords), n=1, cutoff=0.85)
+        return bool(close)
     
     def _build_indices(self):
         """Build search indices for columns and values"""
@@ -155,9 +185,15 @@ class MultiTableQueryParser:
     
     def _tokenize_query(self, query: str) -> List[str]:
         """Tokenize query into words"""
-        # Extract words (alphanumeric sequences)
-        tokens = re.findall(r'\b\w+\b', query)
-        return [t for t in tokens if len(t) > 1]  # Skip single-char tokens
+        raw_tokens = re.findall(r'\b\w+\b', query)
+        tokens: List[str] = []
+        for token in raw_tokens:
+            if len(token) <= 1:
+                continue
+            if self._is_stopword(token):
+                continue
+            tokens.append(token)
+        return tokens
     
     def _identify_operations(self, query_lower: str) -> List[str]:
         """Identify SQL operations requested in the query"""

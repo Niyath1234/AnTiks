@@ -12,18 +12,10 @@
         <div class="sidebar__section">
           <h2>Data Sandbox</h2>
           <p>Upload an Excel workbook to publish a new table in the sandbox database. Once processed, you can chat with it instantly.</p>
-          <form class="sidebar__form" id="upload-form">
-            <label for="table-name">Table name</label>
-            <input type="text" id="table-name" name="table" placeholder="e.g., adh2025" required />
-            <label for="sheet-index">Sheet (1-based)</label>
-            <input type="number" id="sheet-index" name="sheet" min="1" value="1" />
-            <label for="excel-file" class="sidebar__file-label">Excel file (.xlsx or .xls)</label>
-            <input type="file" id="excel-file" name="file" accept=".xlsx,.xls" required />
-            <div class="sidebar__form-actions">
-              <button type="submit" id="upload-btn">Add table</button>
-              <button type="button" id="refresh-btn">Refresh sandbox</button>
-            </div>
-          </form>
+          <div class="sidebar__form-actions sidebar__form-actions--vertical">
+            <button type="button" id="open-upload-modal" class="sidebar__open-upload">Add table</button>
+            <button type="button" id="refresh-btn">Refresh sandbox</button>
+          </div>
           <p class="sidebar__status" id="upload-status">Ready for upload.</p>
           <div class="sidebar__datasets">
             <h3>Dataset keys</h3>
@@ -94,6 +86,40 @@
       </div>
     </div>
 
+    <div id="upload-modal" class="modal hidden">
+      <div class="modal__backdrop"></div>
+      <div class="modal__panel">
+        <div class="modal__header">
+          <h2>Upload Table</h2>
+          <button type="button" id="upload-modal-close" class="modal__close">&times;</button>
+        </div>
+        <form class="modal__form" id="upload-form">
+          <label for="table-name">Table name</label>
+          <input type="text" id="table-name" name="table" placeholder="e.g., adh2025" required />
+
+          <label for="sheet-index">Sheet (1-based)</label>
+          <input type="number" id="sheet-index" name="sheet" min="1" value="1" />
+
+          <label>Excel file (.xlsx or .xls)</label>
+          <div id="upload-dropzone" class="upload-dropzone">
+            <input type="file" id="excel-file" name="file" accept=".xlsx,.xls" required hidden />
+            <div class="upload-dropzone__content">
+              <span class="upload-dropzone__icon">📁</span>
+              <p class="upload-dropzone__text">
+                Drag &amp; drop a workbook here, or <span class="upload-dropzone__browse">browse</span>
+              </p>
+              <p class="upload-dropzone__hint" id="upload-file-name">No file chosen</p>
+            </div>
+          </div>
+
+          <div class="modal__actions">
+            <button type="submit" id="upload-btn">Add table</button>
+            <button type="button" id="upload-modal-cancel">Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
     <script>
       const chat = document.getElementById('chat');
       const composer = document.getElementById('composer');
@@ -113,6 +139,12 @@
       const graphStatus = document.getElementById('graph-status');
       const graphSaveBtn = document.getElementById('graph-save');
       const graphCloseBtn = document.getElementById('graph-close');
+      const uploadModal = document.getElementById('upload-modal');
+      const openUploadModalBtn = document.getElementById('open-upload-modal');
+      const closeUploadModalBtn = document.getElementById('upload-modal-close');
+      const cancelUploadModalBtn = document.getElementById('upload-modal-cancel');
+      const uploadDropzone = document.getElementById('upload-dropzone');
+      const uploadFileName = document.getElementById('upload-file-name');
 
       let cachedDatasets = [];
       const schemaCache = {};
@@ -685,9 +717,50 @@
             botMsg += ` Use the Refresh button when you want the assistant to pick up all new tables.`;
           }
           createBubble('bot', botMsg);
+<<<<<<< Current (Your changes)
+=======
+        closeUploadModal();
+>>>>>>> Incoming (Background Agent changes)
         } catch (error) {
           setUploadStatus(error.message, 'error');
         }
+      }
+
+      function openUploadModal() {
+        uploadModal?.classList.remove('hidden');
+        uploadModal?.setAttribute('aria-hidden', 'false');
+      }
+
+      function closeUploadModal() {
+        uploadModal?.classList.add('hidden');
+        uploadModal?.setAttribute('aria-hidden', 'true');
+        if (uploadForm) uploadForm.reset();
+        if (uploadFileName) uploadFileName.textContent = 'No file chosen';
+      }
+
+      function enableDropzone() {
+        if (!uploadDropzone || !fileInput) return;
+
+        uploadDropzone.addEventListener('click', () => fileInput.click());
+        uploadDropzone.addEventListener('dragover', (event) => {
+          event.preventDefault();
+          uploadDropzone.classList.add('upload-dropzone--hover');
+        });
+        uploadDropzone.addEventListener('dragleave', () => {
+          uploadDropzone.classList.remove('upload-dropzone--hover');
+        });
+        uploadDropzone.addEventListener('drop', (event) => {
+          event.preventDefault();
+          uploadDropzone.classList.remove('upload-dropzone--hover');
+          if (event.dataTransfer?.files?.length) {
+            fileInput.files = event.dataTransfer.files;
+            uploadFileName.textContent = event.dataTransfer.files[0].name;
+          }
+        });
+        fileInput.addEventListener('change', () => {
+          const file = fileInput.files?.[0];
+          uploadFileName.textContent = file ? file.name : 'No file chosen';
+        });
       }
 
       async function handleRefresh() {
@@ -721,6 +794,20 @@
       composer?.addEventListener('submit', sendMessage);
       uploadForm?.addEventListener('submit', handleUpload);
       refreshButton?.addEventListener('click', handleRefresh);
+      openUploadModalBtn?.addEventListener('click', openUploadModal);
+      closeUploadModalBtn?.addEventListener('click', closeUploadModal);
+      cancelUploadModalBtn?.addEventListener('click', closeUploadModal);
+      uploadModal?.addEventListener('click', (event) => {
+        if (event.target === uploadModal) {
+          closeUploadModal();
+        }
+      });
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && !uploadModal?.classList.contains('hidden')) {
+          closeUploadModal();
+        }
+      });
+      enableDropzone();
       graphSaveBtn?.addEventListener('click', saveGraph);
       graphCloseBtn?.addEventListener('click', closeGraphBoard);
       graphBoard?.addEventListener('click', (event) => {
