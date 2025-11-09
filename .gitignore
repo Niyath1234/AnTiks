@@ -1,0 +1,24 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Virtual environments
+text_to_sql_env/
+.env/
+.venv/
+
+# OS files
+.DS_Store
+
+# Model / data caches
+*.duckdb
+*.db
+vector_store/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp

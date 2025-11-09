@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AnTiks_V1</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="sidebar__section">
+          <h2>Data Sandbox</h2>
+          <p>Upload an Excel workbook to publish a new table in the sandbox database. Once processed, you can chat with it instantly.</p>
+          <form class="sidebar__form" id="upload-form">
+            <label for="table-name">Table name</label>
+            <input type="text" id="table-name" name="table" placeholder="e.g., adh2025" required />
+            <label for="sheet-index">Sheet (1-based)</label>
+            <input type="number" id="sheet-index" name="sheet" min="1" value="1" />
+            <label for="excel-file" class="sidebar__file-label">Excel file (.xlsx or .xls)</label>
+            <input type="file" id="excel-file" name="file" accept=".xlsx,.xls" required />
+            <div class="sidebar__form-actions">
+              <button type="submit" id="upload-btn">Add table</button>
+              <button type="button" id="refresh-btn">Refresh sandbox</button>
+            </div>
+          </form>
+          <p class="sidebar__status" id="upload-status">Ready for upload.</p>
+          <div class="sidebar__datasets">
+            <h3>Dataset keys</h3>
+            <ul id="dataset-list" class="sidebar__dataset-list"></ul>
+          </div>
+        </div>
+        <div class="sidebar__section sidebar__section--tips">
+          <h3>Prompt ideas</h3>
+          <ul class="sidebar__tips">
+            <li>“Total disbursement per zone after 2019.”</li>
+            <li>“List distinct <code>psl_type</code> values.”</li>
+            <li>“For these products, show the total final outstanding.”</li>
+          </ul>
+        </div>
+      </aside>
+      <div class="app__main">
+        <header class="app__header">
+          <h1>AnTiks_V1</h1>
+          <p>Ask natural-language questions about your data. Mention tables, columns, and filters for the crispest answers. All queries run in a read-only sandbox with instant previews.</p>
+        </header>
+        <main class="chat" id="chat"></main>
+        <form class="composer" id="composer">
+          <textarea id="message" rows="2" placeholder="e.g., Total disbursement per zone after 2019. Columns: ..."></textarea>
+          <div class="composer__actions">
+            <button type="submit" id="send-btn">Send</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <template id="message-template">
+      <div class="bubble">
+        <div class="bubble__meta">
+          <span class="bubble__author"></span>
+          <span class="bubble__time"></span>
+        </div>
+        <div class="bubble__body"></div>
+      </div>
+    </template>
+
+    <div id="graph-board" class="graph-board hidden">
+      <div class="graph-board__backdrop"></div>
+      <div class="graph-board__panel">
+        <div class="graph-board__header">
+          <h2>Schema Relationships</h2>
+          <div class="graph-board__buttons">
+            <button type="button" id="graph-save">Save graph</button>
+            <button type="button" id="graph-close">Close</button>
+          </div>
+        </div>
+        <div class="graph-board__body">
+          <div class="graph-board__canvas-wrapper">
+            <div class="graph-board__canvas" id="graph-canvas">
+              <svg id="graph-links"></svg>
+            </div>
+          </div>
+          <div class="graph-board__side">
+            <h3>Joins</h3>
+            <div id="graph-edges" class="graph-edge-list"></div>
+            <p id="graph-status" class="graph-board__status">Click a column, then another column to create a join.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const chat = document.getElementById('chat');
+      const composer = document.getElementById('composer');
+      const messageInput = document.getElementById('message');
+      const template = document.getElementById('message-template');
+      const uploadForm = document.getElementById('upload-form');
+      const uploadStatus = document.getElementById('upload-status');
+      const tableInput = document.getElementById('table-name');
+      const sheetInput = document.getElementById('sheet-index');
+      const fileInput = document.getElementById('excel-file');
+      const refreshButton = document.getElementById('refresh-btn');
+      const datasetList = document.getElementById('dataset-list');
+      const graphBoard = document.getElementById('graph-board');
+      const graphCanvas = document.getElementById('graph-canvas');
+      const graphLinks = document.getElementById('graph-links');
+      const graphEdges = document.getElementById('graph-edges');
+      const graphStatus = document.getElementById('graph-status');
+      const graphSaveBtn = document.getElementById('graph-save');
+      const graphCloseBtn = document.getElementById('graph-close');
+
+      let cachedDatasets = [];
+      const schemaCache = {};
+      let relationshipsState = [];
+      let nodePositions = {};
+      let pendingConnection = null;
+      let dragState = null;
+
+      function escapeHtml(str) {
+        return str.replace(/[&<>"']/g, (char) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char] || char));
+      }
+
+      function createBubble(role, text) {
+        if (!template || !chat) return;
+        const node = template.content.cloneNode(true);
+        const bubble = node.querySelector('.bubble');
+        bubble.classList.add(role === 'user' ? 'bubble--user' : 'bubble--bot');
+        bubble.querySelector('.bubble__author').textContent = role === 'user' ? 'You' : 'Assistant';
+        bubble.querySelector('.bubble__time').textContent = new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+        bubble.querySelector('.bubble__body').innerHTML = text;
+        chat.appendChild(node);
+        chat.scrollTop = chat.scrollHeight;
+      }
+
+      function setUploadStatus(text, variant = 'idle') {
+        if (!uploadStatus) return;
+        uploadStatus.textContent = text;
+        uploadStatus.classList.remove('sidebar__status--error', 'sidebar__status--success', 'sidebar__status--progress');
+        if (variant === 'error') uploadStatus.classList.add('sidebar__status--error');
+        if (variant === 'success') uploadStatus.classList.add('sidebar__status--success');
+        if (variant === 'progress') uploadStatus.classList.add('sidebar__status--progress');
+      }
+
+      function renderDatasets(datasets = [], activeAlias = null) {
+        cachedDatasets = datasets;
+        if (!datasetList) return;
+        datasetList.innerHTML = '';
+        if (!datasets.length) {
+          const li = document.createElement('li');
+          li.textContent = 'No datasets uploaded yet.';
+          li.classList.add('sidebar__dataset-item');
+          datasetList.appendChild(li);
+          return;
+        }
+        datasets.forEach(({ alias, table }) => {
+          const li = document.createElement('li');
+          li.classList.add('sidebar__dataset-item');
+          if (activeAlias && activeAlias === alias) {
+            li.classList.add('sidebar__dataset-item--active');
+          }
+
+          const info = document.createElement('div');
+          info.className = 'sidebar__dataset-info';
+          const textWrapper = document.createElement('div');
+          const aliasSpan = document.createElement('span');
+          aliasSpan.className = 'sidebar__dataset-alias';
+          aliasSpan.textContent = alias;
+          const tableSpan = document.createElement('span');
+          tableSpan.className = 'sidebar__dataset-table';
+          tableSpan.textContent = table;
+          textWrapper.append(aliasSpan, tableSpan);
+
+          const controls = document.createElement('div');
+          controls.className = 'sidebar__dataset-buttons';
+
+          const boardBtn = document.createElement('button');
+          boardBtn.type = 'button';
+          boardBtn.className = 'sidebar__dataset-board';
+          boardBtn.textContent = 'Schema board';
+          boardBtn.title = `Open schema board for ${alias}`;
+          boardBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            openGraphBoard(alias);
+          });
+
+          const removeBtn = document.createElement('button');
+          removeBtn.type = 'button';
+          removeBtn.className = 'sidebar__dataset-remove';
+          removeBtn.title = `Remove ${alias}`;
+          removeBtn.textContent = 'Remove';
+          removeBtn.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            const confirmDelete = confirm(`Remove dataset ${alias}? This drops table ${table}.`);
+            if (!confirmDelete) return;
+            try {
+              setUploadStatus(`Removing ${alias}…`, 'progress');
+              const response = await fetch(`/api/datasets/${alias}`, { method: 'DELETE' });
+              const data = await response.json().catch(() => ({}));
+              if (!response.ok) {
+                throw new Error(data.detail || 'Delete failed');
+              }
+              renderDatasets(data.datasets || [], data.active);
+              setUploadStatus(`Removed dataset ${alias}.`, 'success');
+              createBubble('bot', `Dataset <code>${escapeHtml(alias)}</code> removed. Remember to refresh the sandbox if you were using it in joins.`);
+            } catch (error) {
+              setUploadStatus(error.message, 'error');
+            }
+          });
+
+          controls.append(boardBtn, removeBtn);
+          info.append(textWrapper, controls);
+          li.append(info);
+          datasetList.appendChild(li);
+        });
+      }
+
+      async function refreshDatasets() {
+        try {
+          const response = await fetch('/api/datasets');
+          const data = await response.json();
+          renderDatasets(data.datasets || [], data.active);
+          return data.datasets || [];
+        } catch (error) {
+          renderDatasets();
+          return [];
+        }
+      }
+
+      async function getSchema(alias) {
+        if (schemaCache[alias]) return schemaCache[alias];
+        const response = await fetch(`/api/schema/${alias}`);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data.detail || `Unable to load schema for ${alias}`);
+        }
+        schemaCache[alias] = data;
+        return data;
+      }
+
+      async function fetchRelationships() {
+        const response = await fetch('/api/relationships');
+        if (!response.ok) {
+          return { relationships: [], positions: {}, active: null };
+        }
+        const data = await response.json();
+        relationshipsState = data.relationships || [];
+        nodePositions = data.positions || {};
+        return data;
+      }
+
+      function openGraphBoard(focusAlias = null) {
+        if (!cachedDatasets.length) {
+          refreshDatasets().then(() => openGraphBoard(focusAlias));
+          return;
+        }
+        Promise.all([
+          Promise.all(cachedDatasets.map(({ alias }) => getSchema(alias))),
+          fetchRelationships(),
+        ])
+          .then(([schemas, relData]) => {
+            relationshipsState = relData.relationships || relationshipsState;
+            nodePositions = relData.positions || nodePositions;
+            if (!focusAlias && relData.active) {
+              focusAlias = relData.active;
+            }
+            setGraphStatus('Click a column, then another column to create a join.');
+            graphBoard?.classList.remove('hidden');
+            requestAnimationFrame(() => {
+              renderGraphNodes(schemas, focusAlias);
+              renderRelationshipsList();
+              renderConnections();
+            });
+          })
+          .catch((error) => {
+            setGraphStatus(error.message || 'Failed to open schema board.', 'error');
+            graphBoard?.classList.remove('hidden');
+          });
+      }
+
+      function closeGraphBoard() {
+        graphBoard?.classList.add('hidden');
+        clearPendingConnection();
+      }
+
+      function renderGraphNodes(schemas) {
+        if (!graphCanvas) return;
+        graphCanvas.querySelectorAll('.graph-node').forEach((node) => node.remove());
+        const defaultPositions = (index) => {
+          const col = index % 2;
+          const row = Math.floor(index / 2);
+          return {
+            x: 80 + col * 260,
+            y: 80 + row * 240,
+          };
+        };
+
+        schemas.forEach((schema, index) => {
+          const alias = schema.alias;
+          const node = document.createElement('div');
+          node.className = 'graph-node';
+          node.dataset.alias = alias;
+          const pos = nodePositions[alias] || defaultPositions(index);
+          node.style.left = `${pos.x}px`;
+          node.style.top = `${pos.y}px`;
+          nodePositions[alias] = pos;
+
+          const header = document.createElement('div');
+          header.className = 'graph-node__header';
+          header.textContent = alias;
+          const tableLabel = document.createElement('span');
+          tableLabel.className = 'graph-node__table';
+          tableLabel.textContent = schema.table;
+          header.append(tableLabel);
+
+          const body = document.createElement('div');
+          body.className = 'graph-node__columns';
+          (schema.columns || []).forEach((column) => {
+            const colEl = document.createElement('button');
+            colEl.type = 'button';
+            colEl.className = 'graph-column';
+            colEl.dataset.alias = alias;
+            colEl.dataset.column = column;
+            colEl.textContent = column;
+            colEl.addEventListener('click', handleColumnClick);
+            body.append(colEl);
+          });
+
+          node.append(header, body);
+          graphCanvas.append(node);
+
+          header.addEventListener('pointerdown', (event) => startDrag(event, node, alias));
+        });
+      }
+
+      function renderRelationshipsList() {
+        if (!graphEdges) return;
+        graphEdges.innerHTML = '';
+        if (!relationshipsState.length) {
+          const empty = document.createElement('p');
+          empty.className = 'graph-edge-empty';
+          empty.textContent = 'No joins defined yet.';
+          graphEdges.append(empty);
+          return;
+        }
+
+        relationshipsState.forEach((rel, index) => {
+          const row = document.createElement('div');
+          row.className = 'graph-edge-row';
+
+          const left = document.createElement('span');
+          left.textContent = `${rel.source_alias}.${rel.source_column}`;
+          const right = document.createElement('span');
+          right.textContent = `${rel.target_alias}.${rel.target_column}`;
+
+          const select = document.createElement('select');
+          select.className = 'graph-edge-join';
+          ['inner', 'left', 'right', 'full'].forEach((option) => {
+            const opt = document.createElement('option');
+            opt.value = option;
+            opt.textContent = option.toUpperCase();
+            select.append(opt);
+          });
+          select.value = rel.join_type || 'inner';
+          select.addEventListener('change', (event) => {
+            relationshipsState[index].join_type = event.target.value;
+            renderConnections();
+          });
+
+          const remove = document.createElement('button');
+          remove.type = 'button';
+          remove.className = 'graph-edge-remove';
+          remove.textContent = 'Remove';
+          remove.addEventListener('click', () => {
+            relationshipsState.splice(index, 1);
+            renderRelationshipsList();
+            renderConnections();
+          });
+
+          row.append(left, select, right, remove);
+          graphEdges.append(row);
+        });
+      }
+
+      function renderConnections() {
+        if (!graphLinks || !graphCanvas) return;
+        graphLinks.setAttribute('width', graphCanvas.clientWidth);
+        graphLinks.setAttribute('height', graphCanvas.clientHeight);
+        graphLinks.innerHTML = '';
+
+        relationshipsState.forEach((rel) => {
+          const sourceEl = graphCanvas.querySelector(`.graph-column[data-alias="${rel.source_alias}"][data-column="${rel.source_column}"]`);
+          const targetEl = graphCanvas.querySelector(`.graph-column[data-alias="${rel.target_alias}"][data-column="${rel.target_column}"]`);
+          if (!sourceEl || !targetEl) return;
+
+          const canvasRect = graphCanvas.getBoundingClientRect();
+          const srcRect = sourceEl.getBoundingClientRect();
+          const tgtRect = targetEl.getBoundingClientRect();
+          const x1 = srcRect.right - canvasRect.left;
+          const y1 = srcRect.top + srcRect.height / 2 - canvasRect.top;
+          const x2 = tgtRect.left - canvasRect.left;
+          const y2 = tgtRect.top + tgtRect.height / 2 - canvasRect.top;
+          const control = Math.max(Math.abs(x2 - x1) * 0.35, 60);
+
+          const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+          if (x2 >= x1) {
+            path.setAttribute('d', `M${x1} ${y1} C ${x1 + control} ${y1}, ${x2 - control} ${y2}, ${x2} ${y2}`);
+          } else {
+            const midX = (x1 + x2) / 2;
+            const midY = (y1 + y2) / 2;
+            path.setAttribute('d', `M${x1} ${y1} C ${x1 + control} ${y1}, ${midX} ${y1}, ${midX} ${midY} S ${x2 - control} ${y2}, ${x2} ${y2}`);
+          }
+          path.classList.add('graph-link');
+          graphLinks.appendChild(path);
+        });
+      }
+
+      function clearPendingConnection() {
+        if (pendingConnection && pendingConnection.element) {
+          pendingConnection.element.classList.remove('graph-column--selected');
+        }
+        pendingConnection = null;
+      }
+
+      function handleColumnClick(event) {
+        const el = event.currentTarget;
+        const alias = el.dataset.alias;
+        const column = el.dataset.column;
+        if (!pendingConnection) {
+          pendingConnection = { alias, column, element: el };
+          el.classList.add('graph-column--selected');
+          setGraphStatus(`Selected ${alias}.${column}. Choose a column in another dataset to create a join.`);
+          return;
+        }
+        if (pendingConnection.alias === alias && pendingConnection.column === column) {
+          clearPendingConnection();
+          setGraphStatus('Click a column, then another column to create a join.');
+          return;
+        }
+        if (pendingConnection.alias === alias) {
+          pendingConnection.element.classList.remove('graph-column--selected');
+          pendingConnection = { alias, column, element: el };
+          el.classList.add('graph-column--selected');
+          setGraphStatus(`Selected ${alias}.${column}. Choose a column in another dataset to create a join.`);
+          return;
+        }
+
+        createRelationship(pendingConnection.alias, pendingConnection.column, alias, column);
+        pendingConnection.element.classList.remove('graph-column--selected');
+        pendingConnection = null;
+        setGraphStatus('Join added. Adjust join type below if needed.', 'success');
+        renderRelationshipsList();
+        renderConnections();
+      }
+
+      function createRelationship(sourceAlias, sourceColumn, targetAlias, targetColumn) {
+        const duplicate = relationshipsState.find((rel) =>
+          (rel.source_alias === sourceAlias && rel.source_column === sourceColumn && rel.target_alias === targetAlias && rel.target_column === targetColumn) ||
+          (rel.source_alias === targetAlias && rel.source_column === targetColumn && rel.target_alias === sourceAlias && rel.target_column === sourceColumn)
+        );
+        if (duplicate) return;
+        relationshipsState.push({
+          source_alias: sourceAlias,
+          source_column: sourceColumn,
+          target_alias: targetAlias,
+          target_column: targetColumn,
+          join_type: 'inner',
+        });
+      }
+
+      function setGraphStatus(text, variant = 'idle') {
+        if (!graphStatus) return;
+        graphStatus.textContent = text;
+        graphStatus.classList.remove('graph-board__status--error', 'graph-board__status--success', 'graph-board__status--progress');
+        if (variant === 'error') graphStatus.classList.add('graph-board__status--error');
+        if (variant === 'success') graphStatus.classList.add('graph-board__status--success');
+        if (variant === 'progress') graphStatus.classList.add('graph-board__status--progress');
+      }
+
+      async function saveGraph() {
+        setGraphStatus('Saving relationships…', 'progress');
+        try {
+          const payload = {
+            relationships: relationshipsState,
+            positions: nodePositions,
+          };
+          const response = await fetch('/api/relationships', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(data.detail || 'Failed to save relationships');
+          }
+          relationshipsState = data.relationships || relationshipsState;
+          nodePositions = data.positions || nodePositions;
+          setGraphStatus('Relationships saved. Close the board or continue editing.', 'success');
+          createBubble('bot', 'Join graph updated. The assistant can now use these joins when answering related questions.');
+        } catch (error) {
+          setGraphStatus(error.message, 'error');
+        }
+      }
+
+      function startDrag(event, node, alias) {
+        event.preventDefault();
+        node.setPointerCapture(event.pointerId);
+        dragState = {
+          alias,
+          node,
+          pointerId: event.pointerId,
+          offsetX: event.clientX - (parseFloat(node.style.left) || 0),
+          offsetY: event.clientY - (parseFloat(node.style.top) || 0),
+        };
+        node.addEventListener('pointermove', dragMove);
+        node.addEventListener('pointerup', dragEnd);
+        node.addEventListener('pointercancel', dragEnd);
+      }
+
+      function dragMove(event) {
+        if (!dragState || event.pointerId !== dragState.pointerId) return;
+        const x = event.clientX - dragState.offsetX;
+        const y = event.clientY - dragState.offsetY;
+        dragState.node.style.left = `${x}px`;
+        dragState.node.style.top = `${y}px`;
+        nodePositions[dragState.alias] = { x, y };
+        renderConnections();
+      }
+
+      function dragEnd(event) {
+        if (!dragState || event.pointerId !== dragState.pointerId) return;
+        dragState.node.releasePointerCapture(event.pointerId);
+        dragState.node.removeEventListener('pointermove', dragMove);
+        dragState.node.removeEventListener('pointerup', dragEnd);
+        dragState.node.removeEventListener('pointercancel', dragEnd);
+        dragState = null;
+        renderConnections();
+      }
+
+      async function sendMessage(event) {
+        event.preventDefault();
+        const message = messageInput.value.trim();
+        if (!message) return;
+        createBubble('user', message.replace(/\n/g, '<br />'));
+        messageInput.value = '';
+        try {
+          createBubble('bot', '<em>Thinking...</em>');
+          const placeholder = chat.lastElementChild;
+          const response = await fetch('/api/query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message }),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(data.detail || 'Request failed');
+          }
+          placeholder.querySelector('.bubble__body').innerHTML = data.reply;
+          placeholder.querySelector('.bubble__time').textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        } catch (error) {
+          const placeholder = chat.lastElementChild;
+          if (placeholder) {
+            placeholder.querySelector('.bubble__body').innerHTML = '<strong>Error:</strong> Could not generate SQL.';
+          }
+        }
+      }
+
+      async function handleUpload(event) {
+        event.preventDefault();
+        const file = fileInput?.files?.[0];
+        const table = tableInput?.value.trim();
+        const sheet = sheetInput?.value || '1';
+        if (!file || !table) {
+          setUploadStatus('Provide a table name and choose an Excel file.', 'error');
+          return;
+        }
+
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('table', table);
+        formData.append('sheet', sheet);
+
+        setUploadStatus('Uploading table…', 'progress');
+        try {
+          const response = await fetch('/api/upload', {
+            method: 'POST',
+            body: formData,
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(data.detail || 'Upload failed');
+          }
+          setUploadStatus(`Table ${data.table} added as ${data.alias} (${data.rows} rows).`, 'success');
+          if (uploadForm) uploadForm.reset();
+          if (fileInput) fileInput.value = '';
+          await refreshDatasets();
+          createBubble('bot', `Added dataset <code>${escapeHtml(data.alias)}</code> (table <code>${escapeHtml(data.table)}</code>). Use the Refresh button when you want the assistant to pick up all new tables.`);
+        } catch (error) {
+          setUploadStatus(error.message, 'error');
+        }
+      }
+
+      async function handleRefresh() {
+        setUploadStatus('Refreshing sandbox metadata…', 'progress');
+        try {
+          const response = await fetch('/api/refresh', { method: 'POST' });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(data.detail || 'Refresh failed');
+          }
+          renderDatasets(data.datasets || [], data.active);
+          setUploadStatus('Sandbox refreshed. All datasets ready.', 'success');
+          createBubble('bot', 'Sandbox metadata rebuilt. The assistant now knows about all uploaded tables and joins.');
+        } catch (error) {
+          setUploadStatus(error.message, 'error');
+        }
+      }
+
+      composer?.addEventListener('submit', sendMessage);
+      uploadForm?.addEventListener('submit', handleUpload);
+      refreshButton?.addEventListener('click', handleRefresh);
+      graphSaveBtn?.addEventListener('click', saveGraph);
+      graphCloseBtn?.addEventListener('click', closeGraphBoard);
+      graphBoard?.addEventListener('click', (event) => {
+        if (event.target === graphBoard) {
+          closeGraphBoard();
+        }
+      });
+      window.addEventListener('resize', () => {
+        if (!graphBoard?.classList.contains('hidden')) {
+          requestAnimationFrame(renderConnections);
+        }
+      });
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && !graphBoard?.classList.contains('hidden')) {
+          closeGraphBoard();
+        }
+      });
+
+      refreshDatasets();
+    </script>
+  </body>
+</html>
