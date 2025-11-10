@@ -31,9 +31,11 @@
           </ul>
         </div>
       </aside>
+      <div id="sidebar-overlay" class="sidebar-overlay hidden"></div>
       <div class="app__main">
         <header class="app__header">
           <h1>AnTiks_V1</h1>
+          <button id="sidebar-toggle" class="sidebar-toggle" aria-label="Toggle sidebar">☰</button>
           <p>Ask natural-language questions about your data. Mention tables, columns, and filters for the crispest answers. All queries run in a read-only sandbox with instant previews.</p>
         </header>
         <main class="chat" id="chat"></main>
@@ -145,6 +147,7 @@
       const cancelUploadModalBtn = document.getElementById('upload-modal-cancel');
       const uploadDropzone = document.getElementById('upload-dropzone');
       const uploadFileName = document.getElementById('upload-file-name');
+      const sidebar = document.querySelector('.sidebar');
 
       let cachedDatasets = [];
       const schemaCache = {};
@@ -153,6 +156,8 @@
       let nodePositions = {};
       let pendingConnection = null;
       let dragState = null;
+      const sidebarToggle = document.getElementById('sidebar-toggle');
+      const sidebarOverlay = document.getElementById('sidebar-overlay');
       let activeTab = 'all';
 
       function escapeHtml(str) {
@@ -320,6 +325,18 @@
       function closeGraphBoard() {
         graphBoard?.classList.add('hidden');
         clearPendingConnection();
+      }
+
+      function openSidebar() {
+        sidebar?.classList.add('sidebar--open');
+        sidebarOverlay?.classList.remove('hidden');
+        document.body.classList.add('sidebar-open');
+      }
+
+      function closeSidebar() {
+        sidebar?.classList.remove('sidebar--open');
+        sidebarOverlay?.classList.add('hidden');
+        document.body.classList.remove('sidebar-open');
       }
 
       function renderGraphNodes(schemas) {
@@ -717,10 +734,7 @@
             botMsg += ` Use the Refresh button when you want the assistant to pick up all new tables.`;
           }
           createBubble('bot', botMsg);
-<<<<<<< Current (Your changes)
-=======
         closeUploadModal();
->>>>>>> Incoming (Background Agent changes)
         } catch (error) {
           setUploadStatus(error.message, 'error');
         }
@@ -806,7 +820,18 @@
         if (event.key === 'Escape' && !uploadModal?.classList.contains('hidden')) {
           closeUploadModal();
         }
+        if (event.key === 'Escape' && sidebar?.classList.contains('sidebar--open')) {
+          closeSidebar();
+        }
       });
+      sidebarToggle?.addEventListener('click', () => {
+        if (sidebar?.classList.contains('sidebar--open')) {
+          closeSidebar();
+        } else {
+          openSidebar();
+        }
+      });
+      sidebarOverlay?.addEventListener('click', closeSidebar);
       enableDropzone();
       graphSaveBtn?.addEventListener('click', saveGraph);
       graphCloseBtn?.addEventListener('click', closeGraphBoard);
