@@ -296,10 +296,25 @@ class MultiTableQueryParser:
         
         return matches
     
+    def _expand_value_synonyms(self, value: str) -> Set[str]:
+        """Return a set of synonyms for a literal value (case-insensitive)."""
+        base = value.strip().lower()
+        synonyms = {base}
+        synonym_map = {
+            "y": {"y", "yes", "true", "1", "on"},
+            "yes": {"y", "yes", "true", "1", "on"},
+            "n": {"n", "no", "false", "0", "off"},
+            "no": {"n", "no", "false", "0", "off"},
+        }
+        if base in synonym_map:
+            synonyms.update(synonym_map[base])
+        return synonyms
+
     def _find_value_matches(self, query: str, tokens: List[str]) -> List[TableColumnMatch]:
         """Find columns by matching values in the query"""
         matches = []
         query_lower = query.lower()
+        token_set = set(tokens)
         
         for table_alias, metadata in self.table_metadata.items():
             table_name = metadata.get('name', table_alias)
@@ -308,16 +323,27 @@ class MultiTableQueryParser:
             for col, values in column_values.items():
                 for val in values:
                     val_str = str(val).lower()
-                    if len(val_str) >= 3 and val_str in query_lower:
+                    candidates = self._expand_value_synonyms(val_str)
+                    if any(candidate in query_lower for candidate in candidates if len(candidate) >= 1):
                         matches.append(TableColumnMatch(
                             table_name=table_name,
                             table_alias=table_alias,
                             column_name=col,
-                            query_token=val_str,
+                            query_token=next(iter(candidates)),
                             confidence=0.9,
                             match_type='value_match'
                         ))
                         break  # Only one match per column
+                    if any(candidate in token_set for candidate in candidates):
+                        matches.append(TableColumnMatch(
+                            table_name=table_name,
+                            table_alias=table_alias,
+                            column_name=col,
+                            query_token=next(iter(candidates)),
+                            confidence=0.85,
+                            match_type='value_match'
+                        ))
+                        break
         
         return matches
     

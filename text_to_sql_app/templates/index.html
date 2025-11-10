@@ -36,13 +36,16 @@
         <header class="app__header">
           <h1>AnTiks_V1</h1>
           <button id="sidebar-toggle" class="sidebar-toggle" aria-label="Toggle sidebar">☰</button>
-          <p>Ask natural-language questions about your data. Mention tables, columns, and filters for the crispest answers. All queries run in a read-only sandbox with instant previews.</p>
         </header>
         <main class="chat" id="chat"></main>
         <form class="composer" id="composer">
-          <textarea id="message" rows="2" placeholder="e.g., Total disbursement per zone after 2019. Columns: ..."></textarea>
-          <div class="composer__actions">
-            <button type="submit" id="send-btn">Send</button>
+          <div class="composer__input-row">
+            <div class="composer__field">
+              <textarea id="message" rows="1" placeholder="Type a message"></textarea>
+            </div>
+            <button type="submit" id="send-btn" aria-label="Send message">
+              <span class="send-icon">➤</span>
+            </button>
           </div>
         </form>
       </div>
@@ -777,6 +780,14 @@
         });
       }
 
+      function initMobileViewportHack() {
+        const setVh = () => {
+          document.documentElement.style.setProperty('--vh', `${window.innerHeight * 0.01}px`);
+        };
+        setVh();
+        window.addEventListener('resize', setVh);
+      }
+
       async function handleRefresh() {
         setUploadStatus('Refreshing sandbox metadata…', 'progress');
         try {
@@ -867,6 +878,7 @@
         }
       });
 
+      initMobileViewportHack();
       refreshDatasets();
     </script>
   </body>

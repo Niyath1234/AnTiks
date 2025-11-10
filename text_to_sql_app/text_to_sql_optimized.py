@@ -12,7 +12,7 @@ import difflib
 import difflib
 import duckdb
 import math
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1407,11 +1407,14 @@ class TextToSQLSystem:
         # Helper to choose replacement
         def choose_column(token: str) -> str:
             lower = token.lower()
+            # Priority 1: Exact match
             if lower in allowed_columns:
                 return allowed_columns[lower]
+            # Priority 2: Normalized match (spaces to underscores)
             norm = lower.replace(" ", "_")
             if norm in allowed_columns:
                 return allowed_columns[norm]
+            # Priority 3: Token map from detected columns
             if lower in token_map and token_map[lower].lower() in allowed_columns:
                 return allowed_columns[token_map[lower].lower()]
             if norm in token_map and token_map[norm].lower() in allowed_columns:
@@ -1420,11 +1423,17 @@ class TextToSQLSystem:
                 return token_map[lower]
             if norm in token_map:
                 return token_map[norm]
-            # Fallback: fuzzy match
-            matches = difflib.get_close_matches(lower, list(allowed_columns.keys()), n=1, cutoff=0.6)
+            # Priority 4: High-confidence fuzzy match (cutoff=0.75, stricter)
+            matches = difflib.get_close_matches(lower, list(allowed_columns.keys()), n=1, cutoff=0.75)
             if matches:
+                logger.warning(f"Column '{token}' fuzzy-matched to '{allowed_columns[matches[0]]}' (strict)")
                 return allowed_columns[matches[0]]
-            # Final fallback: sequence ratio against each allowed column
+            # Priority 5: Lower-confidence fuzzy match (cutoff=0.65)
+            matches = difflib.get_close_matches(lower, list(allowed_columns.keys()), n=1, cutoff=0.65)
+            if matches:
+                logger.warning(f"Column '{token}' fuzzy-matched to '{allowed_columns[matches[0]]}' (medium)")
+                return allowed_columns[matches[0]]
+            # Priority 6: Sequence ratio fallback
             best_match = None
             best_score = 0.0
             for candidate in allowed_columns.keys():
@@ -1433,8 +1442,17 @@ class TextToSQLSystem:
                     best_score = score
                     best_match = candidate
             if best_match and best_score >= 0.55:
+                logger.warning(f"Column '{token}' sequence-matched to '{allowed_columns[best_match]}' (score={best_score:.2f})")
                 return allowed_columns[best_match]
-            return token
+            # No match found - raise explicit error so correction loop can handle it
+            available_list = list(allowed_columns.values())
+            preview = ", ".join(available_list[:10]) if available_list else "(no columns)"
+            message = (
+                f"Column '{token}' is not available in the current schema. "
+                f"Choose from: {preview}."
+            )
+            logger.error(message)
+            raise ValueError(message)
 
         sql = re.sub(
             r"(\.)([A-Za-z_][\w]*)",
@@ -1553,9 +1571,20 @@ class TextToSQLSystem:
         analysis_tables = allowed_tables or []
         analysis = self._analyze_request(refined_summary, analysis_tables, columns_context)
         
+        # Build exhaustive column list from allowed tables
+        available_columns_by_table = []
+        tables_to_list = allowed_tables or list(self.table_columns_map.keys())
+        for table_name in tables_to_list:
+            table_meta = self.table_columns_map.get(table_name)
+            if table_meta:
+                cols = table_meta.get("columns", [])
+                available_columns_by_table.append(f"  {table_name}: {', '.join(cols)}")
+        
+        columns_list = "\n".join(available_columns_by_table) if available_columns_by_table else "No columns available"
+        
         instruction_lines = [
-            "- Use ONLY the EXACT table and column names provided in the schema context below. DO NOT make up or guess column names.",
-            "- If a column name seems close but doesn't match exactly, DO NOT use it. Only use columns that are explicitly listed.",
+            "- CRITICAL: Use ONLY columns listed below under 'AVAILABLE COLUMNS'. DO NOT invent, guess, or use similar column names.",
+            "- If a concept is not in the available columns, you CANNOT include it in the SQL.",
             "- When the request asks for totals, averages, yearly or grouped results, include the appropriate aggregate functions and GROUP BY clauses.",
             "- Only add filters or date conditions if they are explicitly mentioned in the question. Do not infer additional constraints.",
             "- When returning identifiers, names, or list-style answers without aggregates, use DISTINCT so each item appears once unless duplicates are explicitly requested.",
@@ -1563,6 +1592,7 @@ class TextToSQLSystem:
             "- When the user asks for a pivot or for column headers by a category (e.g., secured vs unsecured), implement it with conditional aggregation (SUM(CASE WHEN ...)) on the same table.",
             "- Assume the columns already have suitable data types (e.g., numeric amounts, date fields). Use simple expressions and avoid verbose conversions such as to_number or to_date unless explicitly required.",
             "- Return only the final SQL query without explanations.",
+            f"\n### AVAILABLE COLUMNS (use ONLY these):\n{columns_list}\n"
         ]
         if allowed_tables:
             unique_tables = list(dict.fromkeys(allowed_tables))
@@ -1721,14 +1751,25 @@ SQL Query:
         if query_intent.ordering:
             join_instructions.append(f"- Order results {query_intent.ordering}")
         
+        # Build exhaustive column list
+        available_columns_by_table = []
+        for alias in query_intent.required_tables:
+            table_meta = self.table_columns_map.get(alias)
+            if table_meta:
+                cols = table_meta.get("columns", [])
+                available_columns_by_table.append(f"  {alias}: {', '.join(cols)}")
+        
+        columns_list = "\n".join(available_columns_by_table) if available_columns_by_table else "No columns available"
+        
         instruction_lines = [
-            "- Use ONLY the EXACT table and column names from the schema context. DO NOT invent or guess column names.",
+            "- CRITICAL: Use ONLY columns listed below. DO NOT invent, guess, or use similar column names.",
+            "- If a concept is not in the available columns, you CANNOT include it in the SQL.",
             "- Follow the join specifications exactly as provided.",
             "- When aggregating, ensure all non-aggregated columns are in GROUP BY.",
             "- Return only the final SQL query without explanations.",
-            "- CRITICAL: Every column name in your SQL must appear exactly in the schema below. No variations or similar names.",
         ]
         
+        instruction_lines.append(f"\n### AVAILABLE COLUMNS (use ONLY these):\n{columns_list}\n")
         instruction_lines.extend(join_instructions)
         
         if unit_instruction:
@@ -2208,20 +2249,27 @@ Corrected SQL Query:
                 
                 logger.info(f"Generated SQL: {sql}")
 
-                sql = self._sanitize_sql_tables(
-                    sql,
-                    allowed_aliases_list,
-                    schema_info_used,
-                )
+                try:
+                    sql = self._sanitize_sql_tables(
+                        sql,
+                        allowed_aliases_list,
+                        schema_info_used,
+                    )
 
-                sql = self._sanitize_sql_columns(
-                    sql,
-                    allowed_aliases_list,
-                    schema_info_used,
-                )
+                    sql = self._sanitize_sql_columns(
+                        sql,
+                        allowed_aliases_list,
+                        schema_info_used,
+                    )
 
-                sql = self._coerce_numeric_operations(sql)
-                
+                    sql = self._normalize_sql_literals(sql, schema_info_used)
+                    sql = self._coerce_numeric_comparisons(sql, schema_info_used)
+                    sql = self._coerce_numeric_operations(sql)
+                except ValueError as sanitize_error:
+                    last_error = str(sanitize_error)
+                    logger.warning(f"Sanitization error: {sanitize_error}")
+                    continue
+
                 try:
                     sql = self._cast_numeric_aggregates(sql)
                     self._validate_sql_columns(sql, allowed_tables)
@@ -2481,6 +2529,193 @@ Corrected SQL Query:
             "operations": operations,
             "result_format": result_format,
         }
+
+    def _normalize_sql_literals(
+        self,
+        sql: str,
+        schema_info: Dict[str, Any],
+    ) -> str:
+        """Snap string literals to the closest known column values."""
+        if not sql:
+            return sql
+
+        # Build map of column -> known values
+        column_values_map: Dict[str, Set[str]] = {}
+        schema_map = schema_info.get("column_values_map") or {}
+        for col, values in schema_map.items():
+            if values:
+                column_values_map.setdefault(col.lower(), set()).update(str(v) for v in values)
+
+        literal_normalizations: List[Dict[str, str]] = schema_info.setdefault("literal_normalizations", [])
+
+        for alias, meta in self.table_columns_map.items():
+            for col, values in meta.get("column_values", {}).items():
+                if values:
+                    column_values_map.setdefault(col.lower(), set()).update(str(v) for v in values)
+
+        if not column_values_map:
+            return sql
+
+        def match_literal(column: str, literal: str) -> Optional[str]:
+            choices = column_values_map.get(column.lower())
+            if not choices:
+                return None
+            literal_clean = literal.strip().lower()
+            synonyms = {
+                "yes": "y",
+                "no": "n",
+                "true": "y",
+                "false": "n",
+                "on": "y",
+                "off": "n",
+            }
+            if literal_clean in synonyms:
+                target = synonyms[literal_clean]
+                for choice in choices:
+                    if choice.lower() == target:
+                        return choice
+            for choice in choices:
+                if choice.lower() == literal_clean:
+                    return choice
+            best = difflib.get_close_matches(
+                literal_clean,
+                [choice.lower() for choice in choices],
+                n=1,
+                cutoff=0.6,
+            )
+            if best:
+                target = best[0]
+                for choice in choices:
+                    if choice.lower() == target:
+                        return choice
+            return None
+
+        def replace_equality(match: re.Match) -> str:
+            left = match.group(1)
+            literal = match.group(2)
+            column = left.split(".")[-1]
+            normalized = match_literal(column, literal)
+            if normalized is None or normalized == literal:
+                return match.group(0)
+            literal_normalizations.append({
+                "column": column,
+                "original": literal,
+                "normalized": normalized,
+            })
+            return f"{left} = '{normalized}'"
+
+        def replace_in(match: re.Match) -> str:
+            left = match.group(1)
+            values = match.group(2)
+            column = left.split(".")[-1]
+            parts = [p.strip() for p in values.split(",") if p.strip()]
+            normalized_parts = []
+            updated = False
+            for part in parts:
+                if len(part) >= 2 and part[0] == part[-1] == "'":
+                    literal = part[1:-1]
+                    normalized = match_literal(column, literal)
+                    if normalized is not None and normalized != literal:
+                        normalized_parts.append(f"'{normalized}'")
+                        literal_normalizations.append({
+                            "column": column,
+                            "original": literal,
+                            "normalized": normalized,
+                        })
+                        updated = True
+                        continue
+                normalized_parts.append(part)
+            if not updated:
+                return match.group(0)
+            joined = ", ".join(normalized_parts)
+            return f"{left} IN ({joined})"
+
+        sql = re.sub(
+            r"([A-Za-z_][\w\.]*?)\s*=\s*'([^']*)'",
+            replace_equality,
+            sql,
+        )
+        sql = re.sub(
+            r"([A-Za-z_][\w\.]*?)\s+IN\s*\(([^)]*)\)",
+            replace_in,
+            sql,
+            flags=re.IGNORECASE,
+        )
+        return sql
+
+    def _coerce_numeric_comparisons(
+        self,
+        sql: str,
+        schema_info: Dict[str, Any],
+    ) -> str:
+        """Force numeric comparisons to cast string columns to DOUBLE."""
+        if not sql:
+            return sql
+
+        allowed_columns: Set[str] = set()
+        for alias, meta in self.table_columns_map.items():
+            for col in meta.get("columns", []):
+                allowed_columns.add(col.lower())
+        for col in schema_info.get("columns", []) or []:
+            allowed_columns.add(col.lower())
+
+        numeric_pattern = re.compile(
+            r"([A-Za-z_][\w\.]*)\s*(>=|<=|>|<|=)\s*([0-9]+(?:\.[0-9]+)?)"
+        )
+
+        def numeric_replacer(match: re.Match) -> str:
+            left = match.group(1)
+            op = match.group(2)
+            literal = match.group(3)
+            column = left.split(".")[-1].lower()
+            if column not in allowed_columns:
+                return match.group(0)
+            upper = left.upper()
+            if "TRY_CAST" in upper or "CAST" in upper:
+                return match.group(0)
+            return f"TRY_CAST({left} AS DOUBLE) {op} {literal}"
+
+        sql = numeric_pattern.sub(numeric_replacer, sql)
+
+        # Handle date/time literals
+        date_literal_pattern = re.compile(
+            r"([A-Za-z_][\w\.]*)\s*(>=|<=|>|<|=)\s*'([^']+)'"
+        )
+
+        def date_replacer(match: re.Match) -> str:
+            left = match.group(1)
+            op = match.group(2)
+            literal = match.group(3)
+            column = left.split(".")[-1]
+            column_type = self._lookup_column_type(column) or self._infer_type_from_name(column)
+            if not column_type:
+                return match.group(0)
+            column_type_lower = column_type.lower()
+            if "try_cast" in left.lower() or "cast" in left.lower():
+                return match.group(0)
+            if "timestamp" in column_type_lower or "datetime" in column_type_lower:
+                target = "TIMESTAMP"
+            elif "date" in column_type_lower:
+                target = "DATE"
+            else:
+                return match.group(0)
+            return (
+                f"TRY_CAST({left} AS {target}) {op} TRY_CAST('{literal}' AS {target})"
+            )
+
+        sql = date_literal_pattern.sub(date_replacer, sql)
+
+        return sql
+
+    def _lookup_column_type(self, column_name: str) -> Optional[str]:
+        """Return the stored data type for a column if known."""
+        column_lower = column_name.lower()
+        for meta in self.table_columns_map.values():
+            column_types = meta.get("column_types", {})
+            for name, dtype in column_types.items():
+                if name.lower() == column_lower:
+                    return dtype
+        return None
 
 
 def main():
