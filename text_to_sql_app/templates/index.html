@@ -12,18 +12,10 @@
         <div class="sidebar__section">
           <h2>Data Sandbox</h2>
           <p>Upload an Excel workbook to publish a new table in the sandbox database. Once processed, you can chat with it instantly.</p>
-          <form class="sidebar__form" id="upload-form">
-            <label for="table-name">Table name</label>
-            <input type="text" id="table-name" name="table" placeholder="e.g., adh2025" required />
-            <label for="sheet-index">Sheet (1-based)</label>
-            <input type="number" id="sheet-index" name="sheet" min="1" value="1" />
-            <label for="excel-file" class="sidebar__file-label">Excel file (.xlsx or .xls)</label>
-            <input type="file" id="excel-file" name="file" accept=".xlsx,.xls" required />
-            <div class="sidebar__form-actions">
-              <button type="submit" id="upload-btn">Add table</button>
-              <button type="button" id="refresh-btn">Refresh sandbox</button>
-            </div>
-          </form>
+          <div class="sidebar__form-actions sidebar__form-actions--vertical">
+            <button type="button" id="open-upload-modal" class="sidebar__open-upload">Add table</button>
+            <button type="button" id="refresh-btn">Refresh sandbox</button>
+          </div>
           <p class="sidebar__status" id="upload-status">Ready for upload.</p>
           <div class="sidebar__datasets">
             <h3>Dataset keys</h3>
@@ -39,16 +31,21 @@
           </ul>
         </div>
       </aside>
+      <div id="sidebar-overlay" class="sidebar-overlay hidden"></div>
       <div class="app__main">
         <header class="app__header">
           <h1>AnTiks_V1</h1>
-          <p>Ask natural-language questions about your data. Mention tables, columns, and filters for the crispest answers. All queries run in a read-only sandbox with instant previews.</p>
+          <button id="sidebar-toggle" class="sidebar-toggle" aria-label="Toggle sidebar">☰</button>
         </header>
         <main class="chat" id="chat"></main>
         <form class="composer" id="composer">
-          <textarea id="message" rows="2" placeholder="e.g., Total disbursement per zone after 2019. Columns: ..."></textarea>
-          <div class="composer__actions">
-            <button type="submit" id="send-btn">Send</button>
+          <div class="composer__input-row">
+            <div class="composer__field">
+              <textarea id="message" rows="1" placeholder="Type a message"></textarea>
+            </div>
+            <button type="submit" id="send-btn" aria-label="Send message">
+              <span class="send-icon">➤</span>
+            </button>
           </div>
         </form>
       </div>
@@ -81,11 +78,50 @@
             </div>
           </div>
           <div class="graph-board__side">
-            <h3>Joins</h3>
+            <h3>Relationships</h3>
+            <div class="graph-board__tabs">
+              <button type="button" class="graph-board__tab graph-board__tab--active" data-tab="all">All</button>
+              <button type="button" class="graph-board__tab" data-tab="auto">Auto-detected</button>
+              <button type="button" class="graph-board__tab" data-tab="manual">Manual</button>
+            </div>
             <div id="graph-edges" class="graph-edge-list"></div>
             <p id="graph-status" class="graph-board__status">Click a column, then another column to create a join.</p>
           </div>
         </div>
+      </div>
+    </div>
+
+    <div id="upload-modal" class="modal hidden">
+      <div class="modal__backdrop"></div>
+      <div class="modal__panel">
+        <div class="modal__header">
+          <h2>Upload Table</h2>
+          <button type="button" id="upload-modal-close" class="modal__close">&times;</button>
+        </div>
+        <form class="modal__form" id="upload-form">
+          <label for="table-name">Table name</label>
+          <input type="text" id="table-name" name="table" placeholder="e.g., adh2025" required />
+
+          <label for="sheet-index">Sheet (1-based)</label>
+          <input type="number" id="sheet-index" name="sheet" min="1" value="1" />
+
+          <label>Excel file (.xlsx or .xls)</label>
+          <div id="upload-dropzone" class="upload-dropzone">
+            <input type="file" id="excel-file" name="file" accept=".xlsx,.xls" required hidden />
+            <div class="upload-dropzone__content">
+              <span class="upload-dropzone__icon">📁</span>
+              <p class="upload-dropzone__text">
+                Drag &amp; drop a workbook here, or <span class="upload-dropzone__browse">browse</span>
+              </p>
+              <p class="upload-dropzone__hint" id="upload-file-name">No file chosen</p>
+            </div>
+          </div>
+
+          <div class="modal__actions">
+            <button type="submit" id="upload-btn">Add table</button>
+            <button type="button" id="upload-modal-cancel">Cancel</button>
+          </div>
+        </form>
       </div>
     </div>
 
@@ -108,13 +144,24 @@
       const graphStatus = document.getElementById('graph-status');
       const graphSaveBtn = document.getElementById('graph-save');
       const graphCloseBtn = document.getElementById('graph-close');
+      const uploadModal = document.getElementById('upload-modal');
+      const openUploadModalBtn = document.getElementById('open-upload-modal');
+      const closeUploadModalBtn = document.getElementById('upload-modal-close');
+      const cancelUploadModalBtn = document.getElementById('upload-modal-cancel');
+      const uploadDropzone = document.getElementById('upload-dropzone');
+      const uploadFileName = document.getElementById('upload-file-name');
+      const sidebar = document.querySelector('.sidebar');
 
       let cachedDatasets = [];
       const schemaCache = {};
       let relationshipsState = [];
+      let autoDetectedRelationships = [];
       let nodePositions = {};
       let pendingConnection = null;
       let dragState = null;
+      const sidebarToggle = document.getElementById('sidebar-toggle');
+      const sidebarOverlay = document.getElementById('sidebar-overlay');
+      let activeTab = 'all';
 
       function escapeHtml(str) {
         return str.replace(/[&<>"']/g, (char) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char] || char));
@@ -240,10 +287,11 @@
       async function fetchRelationships() {
         const response = await fetch('/api/relationships');
         if (!response.ok) {
-          return { relationships: [], positions: {}, active: null };
+          return { relationships: [], auto_detected_relationships: [], positions: {}, active: null };
         }
         const data = await response.json();
         relationshipsState = data.relationships || [];
+        autoDetectedRelationships = data.auto_detected_relationships || [];
         nodePositions = data.positions || {};
         return data;
       }
@@ -280,6 +328,18 @@
       function closeGraphBoard() {
         graphBoard?.classList.add('hidden');
         clearPendingConnection();
+      }
+
+      function openSidebar() {
+        sidebar?.classList.add('sidebar--open');
+        sidebarOverlay?.classList.remove('hidden');
+        document.body.classList.add('sidebar-open');
+      }
+
+      function closeSidebar() {
+        sidebar?.classList.remove('sidebar--open');
+        sidebarOverlay?.classList.add('hidden');
+        document.body.classList.remove('sidebar-open');
       }
 
       function renderGraphNodes(schemas) {
@@ -335,22 +395,55 @@
       function renderRelationshipsList() {
         if (!graphEdges) return;
         graphEdges.innerHTML = '';
-        if (!relationshipsState.length) {
+        
+        // Filter relationships based on active tab
+        let displayRelationships = [];
+        if (activeTab === 'all') {
+          displayRelationships = relationshipsState;
+        } else if (activeTab === 'auto') {
+          displayRelationships = relationshipsState.filter(rel => rel.auto_detected);
+        } else if (activeTab === 'manual') {
+          displayRelationships = relationshipsState.filter(rel => !rel.auto_detected);
+        }
+        
+        if (!displayRelationships.length) {
           const empty = document.createElement('p');
           empty.className = 'graph-edge-empty';
-          empty.textContent = 'No joins defined yet.';
+          empty.textContent = activeTab === 'auto' ? 'No auto-detected relationships.' : 
+                              activeTab === 'manual' ? 'No manual relationships.' : 
+                              'No relationships defined yet.';
           graphEdges.append(empty);
           return;
         }
 
-        relationshipsState.forEach((rel, index) => {
+        displayRelationships.forEach((rel) => {
+          const actualIndex = relationshipsState.indexOf(rel);
+          
           const row = document.createElement('div');
           row.className = 'graph-edge-row';
+          if (rel.auto_detected) {
+            row.classList.add('graph-edge-row--auto');
+          }
 
+          const leftCol = document.createElement('div');
+          leftCol.className = 'graph-edge-col';
           const left = document.createElement('span');
           left.textContent = `${rel.source_alias}.${rel.source_column}`;
+          leftCol.append(left);
+          
+          if (rel.auto_detected) {
+            const badge = document.createElement('span');
+            badge.className = 'graph-edge-badge';
+            badge.textContent = `${Math.round((rel.confidence || 0) * 100)}%`;
+            badge.title = rel.reason || 'Auto-detected';
+            leftCol.append(badge);
+          }
+
+          const rightCol = document.createElement('div');
+          rightCol.className = 'graph-edge-col';
           const right = document.createElement('span');
           right.textContent = `${rel.target_alias}.${rel.target_column}`;
+          rightCol.append(right);
 
           const select = document.createElement('select');
           select.className = 'graph-edge-join';
@@ -362,7 +455,7 @@
           });
           select.value = rel.join_type || 'inner';
           select.addEventListener('change', (event) => {
-            relationshipsState[index].join_type = event.target.value;
+            relationshipsState[actualIndex].join_type = event.target.value;
             renderConnections();
           });
 
@@ -371,12 +464,12 @@
           remove.className = 'graph-edge-remove';
           remove.textContent = 'Remove';
           remove.addEventListener('click', () => {
-            relationshipsState.splice(index, 1);
+            relationshipsState.splice(actualIndex, 1);
             renderRelationshipsList();
             renderConnections();
           });
 
-          row.append(left, select, right, remove);
+          row.append(leftCol, select, rightCol, remove);
           graphEdges.append(row);
         });
       }
@@ -536,12 +629,16 @@
         renderConnections();
       }
 
-      async function sendMessage(event) {
-        event.preventDefault();
-        const message = messageInput.value.trim();
+      async function sendMessage(event, customMessage = null) {
+        event?.preventDefault();
+        const message = customMessage || messageInput.value.trim();
         if (!message) return;
-        createBubble('user', message.replace(/\n/g, '<br />'));
-        messageInput.value = '';
+        
+        if (!customMessage) {
+          createBubble('user', message.replace(/\n/g, '<br />'));
+          messageInput.value = '';
+        }
+        
         try {
           createBubble('bot', '<em>Thinking...</em>');
           const placeholder = chat.lastElementChild;
@@ -556,12 +653,46 @@
           }
           placeholder.querySelector('.bubble__body').innerHTML = data.reply;
           placeholder.querySelector('.bubble__time').textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          
+          // Attach click handlers to alternative buttons
+          attachAlternativeHandlers();
         } catch (error) {
           const placeholder = chat.lastElementChild;
           if (placeholder) {
             placeholder.querySelector('.bubble__body').innerHTML = '<strong>Error:</strong> Could not generate SQL.';
           }
         }
+      }
+      
+      function attachAlternativeHandlers() {
+        // Find all alternative buttons in the latest response
+        const altButtons = chat.querySelectorAll('.alternative-btn:not(.alternative-btn--selected)');
+        altButtons.forEach(btn => {
+          if (btn.dataset.handlerAttached) return; // Avoid duplicate handlers
+          btn.dataset.handlerAttached = 'true';
+          
+          btn.addEventListener('click', async function() {
+            const queryTerm = this.dataset.queryTerm;
+            const table = this.dataset.table;
+            const column = this.dataset.column;
+            
+            // Find the previous user message
+            const bubbles = Array.from(chat.querySelectorAll('.bubble--user'));
+            if (!bubbles.length) return;
+            
+            const lastUserBubble = bubbles[bubbles.length - 1];
+            const originalQuery = lastUserBubble.querySelector('.bubble__body').textContent;
+            
+            // Build modified query that hints at using specific column
+            const modifiedQuery = `${originalQuery} (use ${table}.${column} for "${queryTerm}")`;
+            
+            // Show user clicked alternative
+            createBubble('user', `<em>Using alternative:</em> ${escapeHtml(table)}.${escapeHtml(column)}`);
+            
+            // Re-run query
+            await sendMessage(null, modifiedQuery);
+          });
+        });
       }
 
       async function handleUpload(event) {
@@ -589,14 +720,72 @@
           if (!response.ok) {
             throw new Error(data.detail || 'Upload failed');
           }
-          setUploadStatus(`Table ${data.table} added as ${data.alias} (${data.rows} rows).`, 'success');
+          const autoDetectedCount = data.auto_detected_relationships || 0;
+          let statusMsg = `Table ${data.table} added as ${data.alias} (${data.rows} rows).`;
+          if (autoDetectedCount > 0) {
+            statusMsg += ` ${autoDetectedCount} relationship(s) auto-detected.`;
+          }
+          setUploadStatus(statusMsg, 'success');
           if (uploadForm) uploadForm.reset();
           if (fileInput) fileInput.value = '';
           await refreshDatasets();
-          createBubble('bot', `Added dataset <code>${escapeHtml(data.alias)}</code> (table <code>${escapeHtml(data.table)}</code>). Use the Refresh button when you want the assistant to pick up all new tables.`);
+          
+          let botMsg = `Added dataset <code>${escapeHtml(data.alias)}</code> (table <code>${escapeHtml(data.table)}</code>).`;
+          if (autoDetectedCount > 0) {
+            botMsg += ` Found ${autoDetectedCount} potential relationship(s) between tables. Check the Schema Board to review them.`;
+          } else {
+            botMsg += ` Use the Refresh button when you want the assistant to pick up all new tables.`;
+          }
+          createBubble('bot', botMsg);
+        closeUploadModal();
         } catch (error) {
           setUploadStatus(error.message, 'error');
         }
+      }
+
+      function openUploadModal() {
+        uploadModal?.classList.remove('hidden');
+        uploadModal?.setAttribute('aria-hidden', 'false');
+      }
+
+      function closeUploadModal() {
+        uploadModal?.classList.add('hidden');
+        uploadModal?.setAttribute('aria-hidden', 'true');
+        if (uploadForm) uploadForm.reset();
+        if (uploadFileName) uploadFileName.textContent = 'No file chosen';
+      }
+
+      function enableDropzone() {
+        if (!uploadDropzone || !fileInput) return;
+
+        uploadDropzone.addEventListener('click', () => fileInput.click());
+        uploadDropzone.addEventListener('dragover', (event) => {
+          event.preventDefault();
+          uploadDropzone.classList.add('upload-dropzone--hover');
+        });
+        uploadDropzone.addEventListener('dragleave', () => {
+          uploadDropzone.classList.remove('upload-dropzone--hover');
+        });
+        uploadDropzone.addEventListener('drop', (event) => {
+          event.preventDefault();
+          uploadDropzone.classList.remove('upload-dropzone--hover');
+          if (event.dataTransfer?.files?.length) {
+            fileInput.files = event.dataTransfer.files;
+            uploadFileName.textContent = event.dataTransfer.files[0].name;
+          }
+        });
+        fileInput.addEventListener('change', () => {
+          const file = fileInput.files?.[0];
+          uploadFileName.textContent = file ? file.name : 'No file chosen';
+        });
+      }
+
+      function initMobileViewportHack() {
+        const setVh = () => {
+          document.documentElement.style.setProperty('--vh', `${window.innerHeight * 0.01}px`);
+        };
+        setVh();
+        window.addEventListener('resize', setVh);
       }
 
       async function handleRefresh() {
@@ -608,8 +797,20 @@
             throw new Error(data.detail || 'Refresh failed');
           }
           renderDatasets(data.datasets || [], data.active);
-          setUploadStatus('Sandbox refreshed. All datasets ready.', 'success');
-          createBubble('bot', 'Sandbox metadata rebuilt. The assistant now knows about all uploaded tables and joins.');
+          const autoDetectedCount = data.auto_detected_relationships || 0;
+          let statusMsg = 'Sandbox refreshed. All datasets ready.';
+          if (autoDetectedCount > 0) {
+            statusMsg += ` ${autoDetectedCount} relationship(s) auto-detected.`;
+          }
+          setUploadStatus(statusMsg, 'success');
+          
+          let botMsg = 'Sandbox metadata rebuilt. The assistant now knows about all uploaded tables';
+          if (autoDetectedCount > 0) {
+            botMsg += ` and ${autoDetectedCount} auto-detected join(s).`;
+          } else {
+            botMsg += '.';
+          }
+          createBubble('bot', botMsg);
         } catch (error) {
           setUploadStatus(error.message, 'error');
         }
@@ -618,6 +819,31 @@
       composer?.addEventListener('submit', sendMessage);
       uploadForm?.addEventListener('submit', handleUpload);
       refreshButton?.addEventListener('click', handleRefresh);
+      openUploadModalBtn?.addEventListener('click', openUploadModal);
+      closeUploadModalBtn?.addEventListener('click', closeUploadModal);
+      cancelUploadModalBtn?.addEventListener('click', closeUploadModal);
+      uploadModal?.addEventListener('click', (event) => {
+        if (event.target === uploadModal) {
+          closeUploadModal();
+        }
+      });
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && !uploadModal?.classList.contains('hidden')) {
+          closeUploadModal();
+        }
+        if (event.key === 'Escape' && sidebar?.classList.contains('sidebar--open')) {
+          closeSidebar();
+        }
+      });
+      sidebarToggle?.addEventListener('click', () => {
+        if (sidebar?.classList.contains('sidebar--open')) {
+          closeSidebar();
+        } else {
+          openSidebar();
+        }
+      });
+      sidebarOverlay?.addEventListener('click', closeSidebar);
+      enableDropzone();
       graphSaveBtn?.addEventListener('click', saveGraph);
       graphCloseBtn?.addEventListener('click', closeGraphBoard);
       graphBoard?.addEventListener('click', (event) => {
@@ -625,6 +851,22 @@
           closeGraphBoard();
         }
       });
+      
+      // Tab switching for relationships
+      document.querySelectorAll('.graph-board__tab').forEach(tab => {
+        tab.addEventListener('click', (event) => {
+          const tabName = event.currentTarget.dataset.tab;
+          activeTab = tabName;
+          
+          // Update active tab styling
+          document.querySelectorAll('.graph-board__tab').forEach(t => t.classList.remove('graph-board__tab--active'));
+          event.currentTarget.classList.add('graph-board__tab--active');
+          
+          // Re-render relationships list
+          renderRelationshipsList();
+        });
+      });
+      
       window.addEventListener('resize', () => {
         if (!graphBoard?.classList.contains('hidden')) {
           requestAnimationFrame(renderConnections);
@@ -636,6 +878,15 @@
         }
       });
 
+      messageInput?.addEventListener('keydown', (event) => {
+        if (!event) return;
+        if (event.key === 'Enter' && !event.shiftKey) {
+          event.preventDefault();
+          sendMessage(event);
+        }
+      });
+
+      initMobileViewportHack();
       refreshDatasets();
     </script>
   </body>

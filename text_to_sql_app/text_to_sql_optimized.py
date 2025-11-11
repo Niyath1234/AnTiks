@@ -9,9 +9,10 @@ import logging
 import sqlite3
 import re
 import difflib
+import difflib
 import duckdb
 import math
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -109,6 +110,8 @@ def find_gguf_file(model_name: str) -> Optional[str]:
 
 # Import shared classes from original file
 from .text_to_sql_architecture import MetadataExtractor, VectorStore, SQLExecutor
+from .multi_table_query_parser import parse_multi_table_query, QueryIntent
+from .column_alternatives import group_alternatives_by_query_term
 
 
 class DuckDBMetadataExtractor(MetadataExtractor):
@@ -461,6 +464,12 @@ class TextToSQLSystem:
     """Optimized Text-to-SQL system with GGUF support"""
 
     COLUMN_VALUE_LIMIT = 40
+    SQL_KEYWORDS = {
+        "select", "from", "where", "join", "inner", "left", "right", "full", "outer",
+        "on", "group", "by", "order", "asc", "desc", "limit", "distinct", "count",
+        "sum", "avg", "min", "max", "case", "when", "then", "else", "end", "and",
+        "or", "not", "as", "having"
+    }
     
     def __init__(self, config: TextToSQLConfig):
         # Override to use optimized SQLLLM
@@ -479,6 +488,24 @@ class TextToSQLSystem:
         
         # Initialize components
         self._initialize_system()
+
+    def _filter_relationships(self) -> None:
+        """Remove relationships that reference tables not currently loaded."""
+        if not self.relationships:
+            return
+        valid_aliases = set(self.table_columns_map.keys())
+        filtered = []
+        for rel in self.relationships:
+            src = rel.get("source_alias")
+            tgt = rel.get("target_alias")
+            if src in valid_aliases and tgt in valid_aliases:
+                filtered.append(rel)
+        if len(filtered) != len(self.relationships):
+            logger.info(
+                "Filtered %d stale relationships referencing unloaded tables",
+                len(self.relationships) - len(filtered),
+            )
+        self.relationships = filtered
 
     @staticmethod
     def _is_table_inventory_query(normalized_query: str) -> bool:
@@ -955,6 +982,7 @@ class TextToSQLSystem:
             logger.info("Loaded table metadata: %s", list(self.table_columns_map.keys()))
             if self.relationships:
                 logger.info("Loaded %d relationships", len(self.relationships))
+                self._filter_relationships()
             
             logger.info("System initialized successfully")
             self._metadata_loaded = True
@@ -1334,6 +1362,186 @@ class TextToSQLSystem:
                 return instruction, factor, label
         return None, None, None
 
+    def _sanitize_sql_columns(
+        self,
+        sql: str,
+        allowed_aliases: List[str],
+        schema_info: Dict[str, Any],
+    ) -> str:
+        """
+        Ensure generated SQL references only real columns from loaded tables.
+        Rewrites hallucinated column names (e.g., loan_id -> loan_account_id).
+        """
+        if not sql:
+            return sql
+
+        # Collect allowed columns from current aliases
+        allowed_columns: Dict[str, str] = {}
+        aliases = allowed_aliases or list(self.table_columns_map.keys())
+        for alias in aliases:
+            table_meta = self.table_columns_map.get(alias)
+            if not table_meta:
+                continue
+            for col in table_meta.get("columns", []):
+                allowed_columns.setdefault(col.lower(), col)
+
+        # Include explicitly selected columns from schema info
+        for col in schema_info.get("columns", []) or []:
+            allowed_columns[col.lower()] = col
+
+        if not allowed_columns:
+            return sql
+
+        # Map query tokens to preferred columns (from detection step)
+        token_map: Dict[str, str] = {}
+        for detection in schema_info.get("column_detections", []) or []:
+            token_raw = detection.get("query_token") or ""
+            column_name = detection.get("column_name")
+            if not column_name:
+                continue
+            normalized_token = token_raw.strip().lower().replace(" ", "_")
+            if normalized_token:
+                token_map.setdefault(normalized_token, column_name)
+            token_map.setdefault(column_name.lower(), column_name)
+
+        # Helper to choose replacement
+        def choose_column(token: str) -> str:
+            lower = token.lower()
+            # Priority 1: Exact match
+            if lower in allowed_columns:
+                return allowed_columns[lower]
+            # Priority 2: Normalized match (spaces to underscores)
+            norm = lower.replace(" ", "_")
+            if norm in allowed_columns:
+                return allowed_columns[norm]
+            # Priority 3: Token map from detected columns
+            if lower in token_map and token_map[lower].lower() in allowed_columns:
+                return allowed_columns[token_map[lower].lower()]
+            if norm in token_map and token_map[norm].lower() in allowed_columns:
+                return allowed_columns[token_map[norm].lower()]
+            if lower in token_map:
+                return token_map[lower]
+            if norm in token_map:
+                return token_map[norm]
+            # Priority 4: High-confidence fuzzy match (cutoff=0.75, stricter)
+            matches = difflib.get_close_matches(lower, list(allowed_columns.keys()), n=1, cutoff=0.75)
+            if matches:
+                logger.warning(f"Column '{token}' fuzzy-matched to '{allowed_columns[matches[0]]}' (strict)")
+                return allowed_columns[matches[0]]
+            # Priority 5: Lower-confidence fuzzy match (cutoff=0.65)
+            matches = difflib.get_close_matches(lower, list(allowed_columns.keys()), n=1, cutoff=0.65)
+            if matches:
+                logger.warning(f"Column '{token}' fuzzy-matched to '{allowed_columns[matches[0]]}' (medium)")
+                return allowed_columns[matches[0]]
+            # Priority 6: Sequence ratio fallback
+            best_match = None
+            best_score = 0.0
+            for candidate in allowed_columns.keys():
+                score = difflib.SequenceMatcher(None, lower, candidate).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_match = candidate
+            if best_match and best_score >= 0.55:
+                logger.warning(f"Column '{token}' sequence-matched to '{allowed_columns[best_match]}' (score={best_score:.2f})")
+                return allowed_columns[best_match]
+            # No match found - raise explicit error so correction loop can handle it
+            available_list = list(allowed_columns.values())
+            preview = ", ".join(available_list[:10]) if available_list else "(no columns)"
+            message = (
+                f"Column '{token}' is not available in the current schema. "
+                f"Choose from: {preview}."
+            )
+            logger.error(message)
+            raise ValueError(message)
+
+        sql = re.sub(
+            r"(\.)([A-Za-z_][\w]*)",
+            lambda m: m.group(1) + choose_column(m.group(2)),
+            sql,
+        )
+
+        def standalone_replacer(match):
+            token = match.group(0)
+            lower = token.lower()
+            if lower in self.SQL_KEYWORDS:
+                return token
+            if lower in allowed_columns or lower in token_map:
+                return choose_column(token)
+            return token
+
+        sql = re.sub(r"\b([A-Za-z_][\w]*)\b", standalone_replacer, sql)
+        return sql
+
+    def _coerce_numeric_operations(self, sql: str) -> str:
+        """Wrap subtraction expressions so both sides are cast to DOUBLE."""
+        if not sql:
+            return sql
+
+        def replacer(match):
+            left = match.group(1)
+            right = match.group(2)
+            return f"(TRY_CAST({left} AS DOUBLE) - TRY_CAST({right} AS DOUBLE))"
+
+        pattern = re.compile(
+            r"(?<!CASE\s)([A-Za-z_][\w\.]*)\s*-\s*([A-Za-z_][\w\.]*)",
+            flags=re.IGNORECASE,
+        )
+        return pattern.sub(replacer, sql)
+
+    def _sanitize_sql_tables(
+        self,
+        sql: str,
+        allowed_aliases: List[str],
+        schema_info: Dict[str, Any],
+    ) -> str:
+        """
+        Remove JOIN clauses that reference tables not currently loaded.
+        If FROM references an unavailable table, replace it with the first allowed table.
+        """
+        if not sql:
+            return sql
+
+        allowed_aliases_set = set(allowed_aliases or [])
+        if not allowed_aliases_set:
+            allowed_aliases_set = set(self.table_columns_map.keys())
+
+        allowed_table_names = {
+            meta["name"]
+            for alias, meta in self.table_columns_map.items()
+            if alias in allowed_aliases_set or not allowed_aliases
+        }
+        allowed_table_names = {name.lower() for name in allowed_table_names if name}
+
+        # Sanitize FROM clause
+        def from_replacer(match):
+            table_name = match.group(1)
+            lower = table_name.lower()
+            if lower in allowed_table_names:
+                return match.group(0)
+            if allowed_table_names:
+                replacement = next(iter(allowed_table_names))
+                return f"FROM {replacement}"
+            return match.group(0)
+
+        sql = re.sub(r"\bFROM\s+([A-Za-z_][\w]*)", from_replacer, sql, flags=re.IGNORECASE)
+
+        # Remove disallowed joins
+        join_pattern = re.compile(
+            r"\bJOIN\s+([A-Za-z_][\w]*)\s+(?:AS\s+)?[A-Za-z_][\w]*\s+ON\b"
+            r"[^;]*?(?=\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bHAVING\b|$)",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        def join_replacer(match):
+            table_name = match.group(1)
+            if table_name.lower() in allowed_table_names:
+                return match.group(0)
+            logger.info("Removing join on unavailable table %s", table_name)
+            return ""
+
+        sql = join_pattern.sub(join_replacer, sql)
+        return sql
+
     def _build_prompt(
         self,
         user_query: str,
@@ -1363,8 +1571,22 @@ class TextToSQLSystem:
         analysis_tables = allowed_tables or []
         analysis = self._analyze_request(refined_summary, analysis_tables, columns_context)
         
+        # Build exhaustive column list from allowed tables
+        available_columns_by_table = []
+        tables_to_list = allowed_tables or list(self.table_columns_map.keys())
+        for table_name in tables_to_list:
+            table_meta = self.table_columns_map.get(table_name)
+            if table_meta:
+                cols = table_meta.get("columns", [])
+                available_columns_by_table.append(f"  {table_name}: {', '.join(cols)}")
+        
+        columns_list = "\n".join(available_columns_by_table) if available_columns_by_table else "No columns available"
+        
         instruction_lines = [
-            "- Use only the tables and columns provided in the schema context.",
+            "- CRITICAL: Use ONLY columns listed below under 'AVAILABLE COLUMNS'. DO NOT invent, guess, or use similar column names.",
+            "- If a concept is not in the available columns, you CANNOT include it in the SQL.",
+            "- When joining another table, aggregate it first in a CTE grouped by the join keys, then join the summary so each base row appears once.",
+            "- Do NOT use functions like TO_DATE or TO_CHAR; instead use TRY_CAST(column AS DATE) or CAST(column AS VARCHAR).",
             "- When the request asks for totals, averages, yearly or grouped results, include the appropriate aggregate functions and GROUP BY clauses.",
             "- Only add filters or date conditions if they are explicitly mentioned in the question. Do not infer additional constraints.",
             "- When returning identifiers, names, or list-style answers without aggregates, use DISTINCT so each item appears once unless duplicates are explicitly requested.",
@@ -1372,6 +1594,7 @@ class TextToSQLSystem:
             "- When the user asks for a pivot or for column headers by a category (e.g., secured vs unsecured), implement it with conditional aggregation (SUM(CASE WHEN ...)) on the same table.",
             "- Assume the columns already have suitable data types (e.g., numeric amounts, date fields). Use simple expressions and avoid verbose conversions such as to_number or to_date unless explicitly required.",
             "- Return only the final SQL query without explanations.",
+            f"\n### AVAILABLE COLUMNS (use ONLY these):\n{columns_list}\n"
         ]
         if allowed_tables:
             unique_tables = list(dict.fromkeys(allowed_tables))
@@ -1427,6 +1650,24 @@ class TextToSQLSystem:
         analysis_lines.append(f"Expected result: {analysis['result_format']}")
         analysis_block = "\n".join(analysis_lines)
 
+        # Build explicit column list
+        column_reminder = []
+        for result in metadata_context:
+            doc = result.get('document', '')
+            if 'Table: ' in doc and 'Columns: ' in doc:
+                table_line = doc.split('\n')[0]  # Get "Table: X"
+                columns_line = doc.split('Columns: ')[1] if 'Columns: ' in doc else ''
+                # Extract just column names (before the data type)
+                if columns_line:
+                    column_reminder.append(f"{table_line}:")
+                    parts = columns_line.split(', ')
+                    for part in parts[:10]:  # Limit to avoid huge lists
+                        col_name = part.split(' (')[0].strip() if ' (' in part else part.split('[')[0].strip()
+                        if col_name:
+                            column_reminder.append(f"  • {col_name}")
+        
+        columns_reminder_text = '\n'.join(column_reminder) if column_reminder else '(see schema above)'
+        
         if "sqlcoder" in self.config.llm_model.lower():
             prompt = f"""### Task
 Generate a SQL query to answer the following question: {clean_query}
@@ -1434,7 +1675,10 @@ Generate a SQL query to answer the following question: {clean_query}
 ### Database Schema
 {context_text}
 
-+{analysis_block}
+### EXACT Column Names (use these EXACTLY as written)
+{columns_reminder_text}
+
+{analysis_block}
 
 ### Instructions
 {instructions}
@@ -1450,6 +1694,132 @@ Database Schema:
 {context_text}
 
 +{analysis_block}
+
+Instructions:
+{instructions}
+
+SQL Query:
+"""
+        return prompt
+    
+    def _build_multi_table_prompt(
+        self,
+        user_query: str,
+        query_intent: QueryIntent,
+        metadata_context: List[Dict],
+        unit_instruction: Optional[str] = None,
+        value_instruction: Optional[str] = None,
+    ) -> str:
+        """Build prompt for multi-table query with explicit join instructions"""
+        
+        context_text = "\n\n".join([result["document"] for result in metadata_context])
+        
+        # Build join instructions
+        join_instructions = []
+        if query_intent.required_joins:
+            join_descriptions = []
+            for join in query_intent.required_joins:
+                src_alias = join.get('source_alias')
+                src_col = join.get('source_column')
+                tgt_alias = join.get('target_alias')
+                tgt_col = join.get('target_column')
+                join_type = join.get('join_type', 'inner').upper()
+                
+                join_desc = f"{join_type} JOIN {tgt_alias} ON {src_alias}.{src_col} = {tgt_alias}.{tgt_col}"
+                join_descriptions.append(join_desc)
+            
+            join_instructions.append(
+                f"- Use these joins to connect tables: {'; '.join(join_descriptions)}"
+            )
+        
+        # Build column selection hints
+        column_hints = []
+        for match in query_intent.requested_columns:
+            column_hints.append(f"{match.table_alias}.{match.column_name}")
+        
+        if column_hints:
+            join_instructions.append(
+                f"- Include these columns in the query: {', '.join(column_hints[:10])}"
+            )
+        
+        # Build operation hints
+        if query_intent.aggregations:
+            agg_desc = ', '.join(query_intent.aggregations)
+            join_instructions.append(f"- Apply these aggregations: {agg_desc}")
+        
+        if query_intent.grouping:
+            join_instructions.append("- Use GROUP BY for aggregated results")
+        
+        if query_intent.ordering:
+            join_instructions.append(f"- Order results {query_intent.ordering}")
+        
+        # Build exhaustive column list
+        available_columns_by_table = []
+        for alias in query_intent.required_tables:
+            table_meta = self.table_columns_map.get(alias)
+            if table_meta:
+                cols = table_meta.get("columns", [])
+                available_columns_by_table.append(f"  {alias}: {', '.join(cols)}")
+        
+        columns_list = "\n".join(available_columns_by_table) if available_columns_by_table else "No columns available"
+        
+        instruction_lines = [
+            "- CRITICAL: Use ONLY columns listed below. DO NOT invent, guess, or use similar column names.",
+            "- If a concept is not in the available columns, you CANNOT include it in the SQL.",
+            "- When joining another table, aggregate it first in a CTE grouped by the join keys, then join the summary so each base row appears once.",
+            "- Do NOT use functions like TO_DATE or TO_CHAR; instead use TRY_CAST(column AS DATE) or CAST(column AS VARCHAR).",
+            "- Follow the join specifications exactly as provided.",
+            "- When aggregating, ensure all non-aggregated columns are in GROUP BY.",
+            "- Return only the final SQL query without explanations.",
+        ]
+        
+        instruction_lines.append(f"\n### AVAILABLE COLUMNS (use ONLY these):\n{columns_list}\n")
+        instruction_lines.extend(join_instructions)
+        
+        if unit_instruction:
+            instruction_lines.append(f"- {unit_instruction}")
+        if value_instruction:
+            instruction_lines.append(f"- {value_instruction}")
+        
+        instructions = "Follow these rules when writing SQL:\n" + "\n".join(instruction_lines)
+        
+        # Build analysis
+        analysis_lines = [
+            "### Analysis",
+            f"Task: {query_intent.original_query}",
+            f"Tables needed: {', '.join(query_intent.required_tables)}",
+            f"Operations: {', '.join(query_intent.operations)}",
+        ]
+        
+        if query_intent.requested_columns:
+            col_summary = [f"{m.table_alias}.{m.column_name}" for m in query_intent.requested_columns[:5]]
+            analysis_lines.append(f"Key columns: {', '.join(col_summary)}")
+        
+        analysis_block = "\n".join(analysis_lines)
+        
+        if "sqlcoder" in self.config.llm_model.lower():
+            prompt = f"""### Task
+Generate a SQL query to answer the following question: {user_query}
+
+### Database Schema
+{context_text}
+
+{analysis_block}
+
+### Instructions
+{instructions}
+
+### SQL Query
+"""
+        else:
+            prompt = f"""You are a SQL expert. Generate a SQL query to answer the following question.
+
+Question: {user_query}
+
+Database Schema:
+{context_text}
+
+{analysis_block}
 
 Instructions:
 {instructions}
@@ -1515,11 +1885,12 @@ Corrected SQL Query:
  
         alias_lookup_global = {meta["name"]: alias for alias, meta in self.table_columns_map.items()}
         value_instruction: Optional[str] = None
-        unit_instruction, unit_factor, unit_label = self._detect_unit_instruction(user_query.lower())
+        base_query_line = next((line.strip() for line in user_query.splitlines() if line.strip()), user_query.strip())
+        unit_instruction, unit_factor, unit_label = self._detect_unit_instruction(base_query_line.lower())
         metadata_context_docs: List[Dict[str, Any]] = []
 
         # Step 1: Check if schema is provided in query (PRIORITY - use this if found)
-        query_schema = self._extract_schema_from_query(user_query)
+        query_schema = self._extract_schema_from_query(base_query_line)
         use_query_schema = query_schema is not None
         
         if use_query_schema:
@@ -1556,7 +1927,7 @@ Corrected SQL Query:
                 "value_corrections": [],
                 "column_corrections": [],
             }
-            user_lower = user_query.lower()
+            user_lower = base_query_line.lower()
             detected_aliases = []
             for alias, meta in self.table_columns_map.items():
                 table_name = meta["name"]
@@ -1592,6 +1963,18 @@ Corrected SQL Query:
                 meta = self.table_columns_map.get(alias)
                 if meta:
                     allowed_tables.append(meta["name"])
+            schema_info_used["tables"] = allowed_tables
+
+        # Ensure we only keep aliases that actually exist right now
+        valid_aliases = set(self.table_columns_map.keys())
+        allowed_aliases = [alias for alias in (allowed_aliases or []) if alias in valid_aliases]
+        # Recompute allowed tables to match filtered aliases
+        if allowed_aliases:
+            allowed_tables = []
+            for alias in allowed_aliases:
+                table_meta = self.table_columns_map.get(alias)
+                if table_meta:
+                    allowed_tables.append(table_meta["name"])
             schema_info_used["tables"] = allowed_tables
  
         # Build context documents explicitly from allowed tables
@@ -1633,7 +2016,28 @@ Corrected SQL Query:
             detected_columns = self._detect_columns_from_query(user_query, schema_info_used.get("tables", []))
             if detected_columns:
                 schema_info_used["columns"] = detected_columns
-            table_name_primary = schema_info_used.get("tables", [None])[0]
+                # Record detections for UI/alternatives
+                table_alias_primary = None
+                tables_list = schema_info_used.get("tables", [])
+                if tables_list:
+                    table_alias_primary = alias_lookup_global.get(tables_list[0])
+                detections = schema_info_used.get("column_detections", [])
+                for col in detected_columns:
+                    detections.append(
+                        {
+                            "table_name": tables_list[0] if tables_list else None,
+                            "table_alias": table_alias_primary,
+                            "column_name": col,
+                            "query_token": col.replace("_", " "),
+                            "confidence": 0.9,
+                            "match_type": "detected",
+                        }
+                    )
+                schema_info_used["column_detections"] = detections
+            
+            # Get primary table if available
+            tables_list = schema_info_used.get("tables", [])
+            table_name_primary = tables_list[0] if tables_list else None
             table_alias_primary = None
             if table_name_primary:
                 table_alias_primary = alias_lookup_global.get(table_name_primary)
@@ -1664,7 +2068,7 @@ Corrected SQL Query:
         else:
             schema_info_used.setdefault("column_corrections", [])
 
-        normalized_query = user_query.strip().lower()
+        normalized_query = base_query_line.strip().lower()
         if self._is_table_inventory_query(normalized_query):
             all_tables = sorted({meta.get("name") for meta in self.table_columns_map.values() if meta.get("name")})
             schema_snapshot = {
@@ -1704,7 +2108,7 @@ Corrected SQL Query:
                     "Use conditional aggregation within table `{}`: compute SUM(CASE WHEN <pivot_column> = 'Value' THEN <measure> ELSE 0 END) for each distinct pivot value, group by the row dimension, and avoid JOIN clauses.".format(allowed_tables[0])
                 )
 
-        normalized_query = user_query.strip().lower()
+        normalized_query = base_query_line.strip().lower()
         allowed_aliases_list = allowed_aliases if isinstance(allowed_aliases, list) else list(allowed_aliases) if allowed_aliases else []
 
         def resolve_primary_table() -> Tuple[Optional[str], Optional[str]]:
@@ -1746,6 +2150,8 @@ Corrected SQL Query:
                     "attempts": 0,
                     "metadata_used": schema_info_used.get("tables", []),
                     "schema_info": schema_info_used,
+                    "column_detections": schema_info_used.get("column_detections", []),
+                    "column_alternatives": schema_info_used.get("column_alternatives", {}),
                     "sandbox_validated": False,
                     "data_columns": ["column_name"],
                     "data_rows": rows,
@@ -1754,18 +2160,82 @@ Corrected SQL Query:
 
         allowed_tables_for_prompt = allowed_tables or schema_info_used.get("tables", [])
 
-        prompt = self._build_prompt(
-            user_query,
-            metadata_context_docs,
-            correction_notes,
-            unit_instruction,
-            value_instruction,
-            allowed_tables=allowed_tables_for_prompt,
-            pivot_instruction=pivot_instruction,
-            fallback_instruction=fallback_instruction,
-            column_corrections=schema_info_used.get("column_corrections"),
-            columns_context=schema_info_used.get("columns", []),
-        )
+        # Determine if this is a multi-table query
+        is_multi_table = len(allowed_tables_for_prompt) > 1
+        query_intent = None
+        numeric_lit_normalizations = []
+
+        if is_multi_table and self.relationships:
+            # Use multi-table query parser
+            try:
+                query_intent = parse_multi_table_query(
+                    user_query,
+                    self.table_columns_map,
+                    self.relationships
+                )
+                
+                # Update schema_info with parsed intent
+                if query_intent.requested_columns:
+                    # Add any columns found by the parser
+                    for match in query_intent.requested_columns:
+                        if match.column_name not in schema_info_used.get("columns", []):
+                            schema_info_used.setdefault("columns", []).append(match.column_name)
+                
+                logger.info(f"Multi-table query detected. Tables: {query_intent.required_tables}, Joins: {len(query_intent.required_joins)}")
+                
+                # Store column detections for response
+                schema_info_used["column_detections"] = [
+                    {
+                        "table_name": match.table_name,
+                        "table_alias": match.table_alias,
+                        "column_name": match.column_name,
+                        "query_token": match.query_token,
+                        "confidence": match.confidence,
+                        "match_type": match.match_type
+                    }
+                    for match in query_intent.requested_columns
+                ]
+                
+            except Exception as e:
+                logger.warning(f"Could not parse multi-table query: {e}. Falling back to standard prompt.")
+                is_multi_table = False
+        
+        # Find alternative columns (for both single and multi table cases)
+        try:
+            alternatives = group_alternatives_by_query_term(
+                user_query,
+                self.table_columns_map,
+                schema_info_used.get("column_detections", []),
+                top_k=3
+            )
+            if alternatives:
+                schema_info_used["column_alternatives"] = alternatives
+                logger.info(f"Found alternatives for: {list(alternatives.keys())}")
+        except Exception as alt_error:
+            logger.warning(f"Could not find column alternatives: {alt_error}")
+        
+        # Build appropriate prompt
+        if is_multi_table and query_intent and query_intent.required_joins:
+            prompt = self._build_multi_table_prompt(
+                user_query,
+                query_intent,
+                metadata_context_docs,
+                unit_instruction,
+                value_instruction,
+            )
+        else:
+            prompt = self._build_prompt(
+                user_query,
+                metadata_context_docs,
+                correction_notes,
+                unit_instruction,
+                value_instruction,
+                allowed_tables=allowed_tables_for_prompt,
+                pivot_instruction=pivot_instruction,
+                fallback_instruction=fallback_instruction,
+                column_corrections=schema_info_used.get("column_corrections"),
+                columns_context=schema_info_used.get("columns", []),
+            )
         
         # Step 3: Generate SQL with self-correction loop
         sql = None
@@ -1783,7 +2253,30 @@ Corrected SQL Query:
                     sql = self._correct_sql(sql, last_error, user_query, metadata_context_docs, allowed_tables)
                 
                 logger.info(f"Generated SQL: {sql}")
-                
+
+                try:
+                    sql = self._rewrite_unsupported_functions(sql)
+                    sql = self._rewrite_joined_aggregates(sql)
+                    sql = self._sanitize_sql_tables(
+                        sql,
+                        allowed_aliases_list,
+                        schema_info_used,
+                    )
+
+                    sql = self._sanitize_sql_columns(
+                        sql,
+                        allowed_aliases_list,
+                        schema_info_used,
+                    )
+
+                    sql = self._normalize_sql_literals(sql, schema_info_used)
+                    sql = self._coerce_numeric_comparisons(sql, schema_info_used)
+                    sql = self._coerce_numeric_operations(sql)
+                except ValueError as sanitize_error:
+                    last_error = str(sanitize_error)
+                    logger.warning(f"Sanitization error: {sanitize_error}")
+                    continue
+
                 try:
                     sql = self._cast_numeric_aggregates(sql)
                     self._validate_sql_columns(sql, allowed_tables)
@@ -1839,6 +2332,8 @@ Corrected SQL Query:
                         "attempts": attempt,
                         "metadata_used": [r.get("metadata", {}).get("table_name", "unknown") for r in metadata_context_docs if r.get("metadata")],
                         "schema_info": schema_info_used,
+                        "column_detections": schema_info_used.get("column_detections", []),
+                        "column_alternatives": schema_info_used.get("column_alternatives", {}),
                         "sandbox_validated": False,
                         "data_columns": None,
                         "data_rows": None,
@@ -1856,6 +2351,8 @@ Corrected SQL Query:
                         "attempts": attempt,
                         "metadata_used": [r.get("metadata", {}).get("table_name", "unknown") for r in metadata_context_docs if r.get("metadata")],
                         "schema_info": schema_info_used,
+                        "column_detections": schema_info_used.get("column_detections", []),
+                        "column_alternatives": schema_info_used.get("column_alternatives", {}),
                         "sandbox_validated": False,
                         "data_columns": None,
                         "data_rows": None,
@@ -1886,6 +2383,8 @@ Corrected SQL Query:
                                 "attempts": attempt,
                                 "metadata_used": [r.get("metadata", {}).get("table_name", "unknown") for r in metadata_context_docs if r.get("metadata")],
                                 "schema_info": schema_info_used,
+                                "column_detections": schema_info_used.get("column_detections", []),
+                                "column_alternatives": schema_info_used.get("column_alternatives", {}),
                                 "sandbox_validated": sandbox,
                                 "data_columns": data_columns,
                                 "data_rows": data_rows,
@@ -1897,13 +2396,15 @@ Corrected SQL Query:
                     except Exception as e:
                         logger.warning(f"Could not execute query: {e}. Table may not exist.")
                         message = f"SQL generated successfully. (Execution skipped - {str(e)})"
-                        return {
-                            "success": True,
-                            "sql": sql,
-                            "status_message": message,
-                            "attempts": attempt,
+                    return {
+                        "success": True,
+                        "sql": sql,
+                        "status_message": message,
+                        "attempts": attempt,
                             "metadata_used": [r.get("metadata", {}).get("table_name", "unknown") for r in metadata_context_docs if r.get("metadata")],
                             "schema_info": schema_info_used,
+                            "column_detections": schema_info_used.get("column_detections", []),
+                            "column_alternatives": schema_info_used.get("column_alternatives", {}),
                             "sandbox_validated": False,
                             "data_columns": None,
                             "data_rows": None,
@@ -1925,6 +2426,8 @@ Corrected SQL Query:
             "attempts": attempt,
             "metadata_used": [r.get("metadata", {}).get("table_name", "unknown") for r in metadata_context_docs if r.get("metadata")],
             "schema_info": schema_info_used,
+            "column_detections": schema_info_used.get("column_detections", []),
+            "column_alternatives": schema_info_used.get("column_alternatives", {}),
             "sandbox_validated": False,
             "status_message": f"SQL generation failed after {attempt} attempts: {last_error}",
             "data_columns": None,
@@ -1941,8 +2444,6 @@ Corrected SQL Query:
         column_values: Dict[str, List[str]] = {}
         limit = self.COLUMN_VALUE_LIMIT
         for index, col in enumerate(column_names):
-            if index >= 12:  # avoid excessive probing
-                break
             try:
                 query = (
                     f'SELECT DISTINCT "{col}" AS value '
@@ -2003,7 +2504,7 @@ Corrected SQL Query:
             add_op("MIN")
         if any(keyword in lower for keyword in ["distinct", "unique"]):
             add_op("DISTINCT")
-        if any(keyword in lower for keyword in [" per ", " by ", "group", "split", "each "]):
+        if any(keyword in lower for keyword in [" per ", " by ", "group", "split "]):
             add_op("GROUP BY")
         if any(keyword in lower for keyword in ["top", "highest", "lowest", "ascending", "descending"]):
             add_op("ORDER BY")
@@ -2033,6 +2534,310 @@ Corrected SQL Query:
             "operations": operations,
             "result_format": result_format,
         }
+
+    def _normalize_sql_literals(
+        self,
+        sql: str,
+        schema_info: Dict[str, Any],
+    ) -> str:
+        """Snap string literals to the closest known column values."""
+        if not sql:
+            return sql
+
+        # Build map of column -> known values
+        column_values_map: Dict[str, Set[str]] = {}
+        schema_map = schema_info.get("column_values_map") or {}
+        for col, values in schema_map.items():
+            if values:
+                column_values_map.setdefault(col.lower(), set()).update(str(v) for v in values)
+
+        literal_normalizations: List[Dict[str, str]] = schema_info.setdefault("literal_normalizations", [])
+
+        for alias, meta in self.table_columns_map.items():
+            for col, values in meta.get("column_values", {}).items():
+                if values:
+                    column_values_map.setdefault(col.lower(), set()).update(str(v) for v in values)
+
+        if not column_values_map:
+            return sql
+
+        def match_literal(column: str, literal: str) -> Optional[str]:
+            choices = column_values_map.get(column.lower())
+            if not choices:
+                return None
+            literal_clean = literal.strip().lower()
+            synonyms = {
+                "yes": "y",
+                "no": "n",
+                "true": "y",
+                "false": "n",
+                "on": "y",
+                "off": "n",
+            }
+            if literal_clean in synonyms:
+                target = synonyms[literal_clean]
+                for choice in choices:
+                    if choice.lower() == target:
+                        return choice
+            for choice in choices:
+                if choice.lower() == literal_clean:
+                    return choice
+            best = difflib.get_close_matches(
+                literal_clean,
+                [choice.lower() for choice in choices],
+                n=1,
+                cutoff=0.6,
+            )
+            if best:
+                target = best[0]
+                for choice in choices:
+                    if choice.lower() == target:
+                        return choice
+            return None
+
+        def replace_equality(match: re.Match) -> str:
+            left = match.group(1)
+            literal = match.group(2)
+            column = left.split(".")[-1]
+            normalized = match_literal(column, literal)
+            if normalized is None or normalized == literal:
+                return match.group(0)
+            literal_normalizations.append({
+                "column": column,
+                "original": literal,
+                "normalized": normalized,
+            })
+            return f"{left} = '{normalized}'"
+
+        def replace_in(match: re.Match) -> str:
+            left = match.group(1)
+            values = match.group(2)
+            column = left.split(".")[-1]
+            parts = [p.strip() for p in values.split(",") if p.strip()]
+            normalized_parts = []
+            updated = False
+            for part in parts:
+                if len(part) >= 2 and part[0] == part[-1] == "'":
+                    literal = part[1:-1]
+                    normalized = match_literal(column, literal)
+                    if normalized is not None and normalized != literal:
+                        normalized_parts.append(f"'{normalized}'")
+                        literal_normalizations.append({
+                            "column": column,
+                            "original": literal,
+                            "normalized": normalized,
+                        })
+                        updated = True
+                        continue
+                normalized_parts.append(part)
+            if not updated:
+                return match.group(0)
+            joined = ", ".join(normalized_parts)
+            return f"{left} IN ({joined})"
+
+        sql = re.sub(
+            r"([A-Za-z_][\w\.]*?)\s*=\s*'([^']*)'",
+            replace_equality,
+            sql,
+        )
+        sql = re.sub(
+            r"([A-Za-z_][\w\.]*?)\s+IN\s*\(([^)]*)\)",
+            replace_in,
+            sql,
+            flags=re.IGNORECASE,
+        )
+        return sql
+
+    def _coerce_numeric_comparisons(
+        self,
+        sql: str,
+        schema_info: Dict[str, Any],
+    ) -> str:
+        """Force numeric comparisons to cast string columns to DOUBLE."""
+        if not sql:
+            return sql
+
+        allowed_columns: Set[str] = set()
+        for alias, meta in self.table_columns_map.items():
+            for col in meta.get("columns", []):
+                allowed_columns.add(col.lower())
+        for col in schema_info.get("columns", []) or []:
+            allowed_columns.add(col.lower())
+
+        numeric_pattern = re.compile(
+            r"([A-Za-z_][\w\.]*)\s*(>=|<=|>|<|=)\s*([0-9]+(?:\.[0-9]+)?)"
+        )
+
+        quoted_numeric_pattern = re.compile(
+            r"([A-Za-z_][\w\.]*)\s*(>=|<=|>|<|=)\s*'([0-9]+(?:\.[0-9]+)?)'"
+        )
+
+        def numeric_replacer(match: re.Match) -> str:
+            left = match.group(1)
+            op = match.group(2)
+            literal = match.group(3)
+            column = left.split(".")[-1].lower()
+            if column not in allowed_columns:
+                return match.group(0)
+            upper = left.upper()
+            if "TRY_CAST" in upper or "CAST" in upper:
+                return match.group(0)
+            return f"TRY_CAST({left} AS DOUBLE) {op} {literal}"
+
+        sql = numeric_pattern.sub(numeric_replacer, sql)
+
+        def quoted_numeric_replacer(match: re.Match) -> str:
+            left = match.group(1)
+            op = match.group(2)
+            literal = match.group(3)
+            column = left.split(".")[-1].lower()
+            if column not in allowed_columns:
+                return match.group(0)
+            upper = left.upper()
+            if "TRY_CAST" in upper or "CAST" in upper:
+                return match.group(0)
+            return f"TRY_CAST({left} AS DOUBLE) {op} {literal}"
+
+        sql = quoted_numeric_pattern.sub(quoted_numeric_replacer, sql)
+
+        # Handle date/time literals
+        date_literal_pattern = re.compile(
+            r"([A-Za-z_][\w\.]*)\s*(>=|<=|>|<|=)\s*'([^']+)'"
+        )
+
+        def date_replacer(match: re.Match) -> str:
+            left = match.group(1)
+            op = match.group(2)
+            literal = match.group(3)
+            column = left.split(".")[-1]
+            column_type = self._lookup_column_type(column) or self._infer_type_from_name(column)
+            if not column_type:
+                return match.group(0)
+            column_type_lower = column_type.lower()
+            if "try_cast" in left.lower() or "cast" in left.lower():
+                return match.group(0)
+            if "timestamp" in column_type_lower or "datetime" in column_type_lower:
+                target = "TIMESTAMP"
+            elif "date" in column_type_lower:
+                target = "DATE"
+            else:
+                return match.group(0)
+            return (
+                f"TRY_CAST({left} AS {target}) {op} TRY_CAST('{literal}' AS {target})"
+            )
+
+        sql = date_literal_pattern.sub(date_replacer, sql)
+
+        coalesce_numeric_pattern = re.compile(
+            r"COALESCE\s*\(([^)]+)\)\s*(>=|<=|>|<|=)\s*([0-9]+(?:\.[0-9]+)?)"
+        )
+
+        def coalesce_numeric_replacer(match: re.Match) -> str:
+            expr = match.group(1)
+            op = match.group(2)
+            literal = match.group(3)
+            return f"COALESCE({expr}) {op} {literal}"
+
+        sql = numeric_pattern.sub(numeric_replacer, sql)
+        sql = quoted_numeric_pattern.sub(quoted_numeric_replacer, sql)
+        sql = coalesce_numeric_pattern.sub(coalesce_numeric_replacer, sql)
+
+        return sql
+
+    def _lookup_column_type(self, column_name: str) -> Optional[str]:
+        """Return the stored data type for a column if known."""
+        column_lower = column_name.lower()
+        for meta in self.table_columns_map.values():
+            column_types = meta.get("column_types", {})
+            for name, dtype in column_types.items():
+                if name.lower() == column_lower:
+                    return dtype
+        return None
+
+    def _rewrite_unsupported_functions(self, sql: str) -> str:
+        """Rewrite non-DuckDB functions (TO_DATE/TO_CHAR) into safe expressions."""
+        if not sql:
+            return sql
+
+        def to_date_replacer(match: re.Match) -> str:
+            expr = match.group(1).strip()
+            return f"TRY_CAST({expr} AS DATE)"
+
+        def to_char_replacer(match: re.Match) -> str:
+            expr = match.group(1).strip()
+            return f"CAST({expr} AS VARCHAR)"
+
+        sql = re.sub(r"TO_DATE\s*\(([^,]+?),\s*'[^']*'\)", to_date_replacer, sql, flags=re.IGNORECASE)
+        sql = re.sub(r"TO_CHAR\s*\(([^,]+?),\s*'[^']*'\)", to_char_replacer, sql, flags=re.IGNORECASE)
+        return sql
+
+    def _requires_dedup_join(self, sql: str) -> bool:
+        return bool(sql and re.search(r"\bJOIN\b", sql, re.IGNORECASE))
+
+    def _rewrite_joined_aggregates(self, sql: str) -> str:
+        """Detect aggregation on primary table while joining another table that may multiply rows."""
+        if not self._requires_dedup_join(sql):
+            return sql
+
+        from_match = re.search(r"FROM\s+([A-Za-z_][\w]*)\s+(?:AS\s+)?([A-Za-z_][\w]*)", sql, re.IGNORECASE)
+        if not from_match:
+            return sql
+        base_table, base_alias = from_match.group(1), from_match.group(2)
+        base_alias_lower = base_alias.lower()
+
+        join_matches = re.finditer(
+            r"JOIN\s+([A-Za-z_][\w]*)\s+(?:AS\s+)?([A-Za-z_][\w]*)\s+ON\s+([^\n]+?)\b(?:JOIN|WHERE|GROUP|HAVING|ORDER|LIMIT|$)",
+            sql,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        agg_patterns = [
+            rf"sum\s*\((?:\s*try_cast\()?(?:{base_alias_lower}\.\w+)",
+            rf"count\s*\((?:\s*distinct\s*)?(?:{base_alias_lower}\.\w+)",
+            rf"avg\s*\((?:\s*try_cast\()?(?:{base_alias_lower}\.\w+)",
+        ]
+
+        if not any(re.search(pattern, sql, re.IGNORECASE) for pattern in agg_patterns):
+            return sql
+
+        for match in join_matches:
+            join_table, join_alias, on_clause = match.group(1), match.group(2), match.group(3)
+            join_alias_lower = join_alias.lower()
+            pairs = []  # (base_key, join_key)
+            for key_match in re.finditer(
+                r"([A-Za-z_][\w]*)\.([A-Za-z_][\w]*)\s*=\s*([A-Za-z_][\w]*)\.([A-Za-z_][\w]*)",
+                on_clause,
+                flags=re.IGNORECASE,
+            ):
+                left_alias, left_col, right_alias, right_col = key_match.groups()
+                if left_alias.lower() == base_alias_lower and right_alias.lower() == join_alias_lower:
+                    pairs.append((left_col, right_col))
+                elif right_alias.lower() == base_alias_lower and left_alias.lower() == join_alias_lower:
+                    pairs.append((right_col, left_col))
+
+            join_keys = [p[1] for p in pairs]
+            base_keys = [p[0] for p in pairs]
+
+            keys_text = ", ".join(join_keys) if join_keys else "<join_key>"
+            base_key_text = ", ".join(base_keys) if base_keys else "<base_key>"
+
+            guidance = (
+                f"Aggregations on `{base_alias}` detected while joining `{join_alias}`, which can duplicate rows from `{base_table}`. "
+                "Rewrite the SQL so the joined table is pre-aggregated. For example:\n\n"
+                f"WITH {join_alias}_summary AS (\n"
+                f"  SELECT {keys_text}, /* aggregated metrics for {join_alias} */\n"
+                f"  FROM {join_table}\n"
+                f"  GROUP BY {keys_text}\n"
+                ")\n"
+                f"SELECT /* aggregated columns */\n"
+                f"FROM {base_table} {base_alias}\n"
+                f"LEFT JOIN {join_alias}_summary {join_alias} ON /* re-use the original join condition using {base_alias}.{base_key_text} */\n"
+                "\nThen reference the aggregated columns from the summary instead of raw values from the joined table."
+            )
+            logger.warning(guidance)
+            raise ValueError(guidance)
+
+        return sql
 
 
 def main():
